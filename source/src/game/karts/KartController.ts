@@ -51,11 +51,12 @@ export class KartController {
 
   // --- drift ----------------------------------------------------------------
   driftActive = false;
-  driftPending = false;   // hopping, drift starts on landing
   driftDir = 0;           // -1 left / 1 right
   driftCharge = 0;
   driftLevel = 0;
   private driftWasHeld = false;
+  /** 1-frame signal: drift just kicked in on the ground (visual suspension pop) */
+  driftKick = 0;
 
   // --- boosts ------------------------------------------------------------------
   boostTimer = 0;
@@ -74,6 +75,12 @@ export class KartController {
   /** one-shot landing signal consumed by Game (0 = none, else boost strength) */
   trickLanded = 0;
   trickSpin = 0;          // normalized 0..1 rotation progress for the visual
+
+  // --- glider / parachute (MK-style: long falls open the canopy) -------------
+  gliderActive = false;
+  gliderDeploy = 0;       // 0..1 canopy open animation
+  /** one-shot signal consumed by Game (announcer + SFX) */
+  gliderOpened = 0;
 
   // --- status ----------------------------------------------------------------------
   spinT = 0;
@@ -169,10 +176,16 @@ export class KartController {
     // re-spin karts the instant they recovered — perpetual donut packs)
     this.invulnT = Math.max(this.invulnT, PHYS.spinTime + 0.4);
     this.endDrift(false);
+    this.closeGlider();
     this.speed *= 0.5;
     this.slip = 0;
     this.wobbleT = 0;
     return true;
+  }
+
+  closeGlider(): void {
+    this.gliderActive = false;
+    this.gliderDeploy = 0;
   }
 
   /** Hard-contact wobble: the kart keeps rolling but shakes and scrubs speed. */
@@ -211,7 +224,6 @@ export class KartController {
       this.applyBoost(mt.time, mt.power);
     }
     this.driftActive = false;
-    this.driftPending = false;
     this.driftCharge = 0;
     this.driftLevel = 0;
   }
@@ -223,6 +235,7 @@ export class KartController {
     this.speed = 0; this.slip = 0; this.vy = 0;
     this.grounded = true; this.requestRespawn = false;
     this.endDrift(false);
+    this.closeGlider();
     this.trickT = 0; this.trickSpin = 0; this.airTime = 0;
     this.invulnT = PHYS.invulnAfterRespawn;
     this.spinT = 0;
@@ -286,17 +299,19 @@ export class KartController {
       this.yaw += Math.sin(this.wobbleT * 34) * PHYS.wobbleStrength * k * dt * 6;
     }
 
-    // 5. drift state machine + air tricks --------------------------------------------
+    // 5. drift state machine + air tricks + glider ------------------------------
     const canDrift = this.grounded && this.speed > PHYS.driftEnterSpeed;
     const driftPressed = driftHeld && !this.driftWasHeld;
     this.driftWasHeld = driftHeld;
+    this.driftKick = Math.max(0, this.driftKick - dt * 8);
 
-    // air trick: hop button pressed mid-air (after a small minimum airtime so
-    // hop-liftoff doesn't count) starts a stunt; landing a finished stunt pays
-    // a boost. Steer picks the stunt: left/right = barrel roll, neutral = flip.
+    // air trick: the drift button pressed mid-air (after a small minimum
+    // airtime so liftoff doesn't count) starts a stunt; landing a finished
+    // stunt pays a boost. Steer picks the stunt: left/right = barrel roll,
+    // neutral = flip.
     if (!this.grounded) this.airTime += dt; else this.airTime = 0;
     if (driftPressed && !this.grounded && this.airTime > PHYS.trickMinAir
-        && this.trickT === 0 && !spinning && !this.driftPending) {
+        && this.trickT === 0 && !spinning && !this.gliderActive) {
       this.trickT = 0.0001;
       this.trickKind = steer < -0.3 ? 1 : steer > 0.3 ? 2 : 0;
     }
@@ -308,18 +323,34 @@ export class KartController {
       }
     }
 
-    if (driftPressed && canDrift) {
-      // hop!
-      this.vy = 6.4;
-      this.grounded = false;
-      this.driftPending = true;
-      this.driftDir = Math.abs(steer) > 0.15 ? Math.sign(steer) : (this.driftDir || 1);
-    }
-    if (this.driftPending && this.grounded && driftHeld) {
+    // GROUND DRIFT: the drift button engages the slide instantly — a party
+    // racer slide, NOT a jump (hops felt like bunny-hopping; MK8-style hop
+    // entry removed on purpose). Direction follows the current steer.
+    if (driftPressed && canDrift && !spinning) {
       this.driftActive = true;
-      this.driftPending = false;
+      this.driftDir = Math.abs(steer) > 0.15 ? Math.sign(steer) : (this.driftDir || 1);
       this.driftCharge = 0;
       this.driftLevel = 0;
+      this.driftKick = 1;
+    }
+
+    // GLIDER: airborne, falling fast and still high above the road → the
+    // canopy pops open (MK7/8 glide sections). Descent slows to a gentle
+    // float so big ramps become soaring lines instead of dead drops.
+    if (!this.grounded && !this.gliderActive && !spinning
+        && (this.trickT === 0 || this.trickSpin >= 1)
+        && this.vy < PHYS.gliderDeployVy) {
+      const gi = this.ginfo;
+      const above = gi && gi.hasGround ? this.pos.y - gi.height : Infinity;
+      if (above > PHYS.gliderMinHeight) {
+        this.gliderActive = true;
+        this.gliderDeploy = 0.0001;
+        this.gliderOpened = 1;
+        this.vy = Math.max(this.vy, PHYS.gliderFallCap * 0.55); // canopy snatch
+      }
+    }
+    if (this.gliderActive) {
+      this.gliderDeploy = Math.min(1, this.gliderDeploy + dt / PHYS.gliderOpenTime);
     }
     if (this.driftActive) {
       if (!driftHeld || this.speed < 7 || spinning) {
@@ -358,8 +389,9 @@ export class KartController {
     }
 
     // 7. steering ------------------------------------------------------------------------------
+    const airAuth = this.gliderActive ? PHYS.gliderSteer : 0.55;
     const authority = steerAuthority(Math.abs(this.speed)) * this.stats.handling
-      * (this.grounded ? 1 : 0.55) * (zoneGrip < 1 ? 0.75 + zoneGrip * 0.25 : 1);
+      * (this.grounded ? 1 : airAuth) * (zoneGrip < 1 ? 0.75 + zoneGrip * 0.25 : 1);
     if (this.driftActive) {
       // driftDir bias + steer modulation: steer with slide = tighter, against = wider
       // NOTE steering sign: positive steer = clockwise on screen = yaw DECREASES
@@ -395,9 +427,9 @@ export class KartController {
           ? 0.20 * Math.abs(this.speed)
           : clamp(this.groundSlope, 0, 0.35) * Math.abs(this.speed);
         this.vy = Math.max(this.vy, launchVy);
-        // A ramp/gap launch cancels the pending hop-drift (MK8 rule): the
-        // kart is now flying, so the next hop-button press is a STUNT.
-        this.driftPending = false;
+        // Leaving the ground ends any active slide (MK rule) — but a charged
+        // drift pays off: ramp-launch mini-turbos feel great.
+        if (this.driftActive) this.endDrift(true);
       } else {
         // follow the surface (also handles driving up ramps); snappy enough
         // to stay glued to 0.22 launch ramps at full speed. The detach
@@ -415,7 +447,12 @@ export class KartController {
       }
     }
     if (!this.grounded) {
-      this.vy += PHYS.gravity * dt;
+      if (this.gliderActive) {
+        // canopy descent: soft gravity + terminal glide speed
+        this.vy = Math.max(this.vy + PHYS.gravity * PHYS.gliderGravityMul * dt, PHYS.gliderFallCap);
+      } else {
+        this.vy += PHYS.gravity * dt;
+      }
       this.pos.y += this.vy * dt;
       // touchdown: only from just above the surface (never snap a kart up
       // from meters below — that used to teleport karts onto the road)
@@ -424,6 +461,11 @@ export class KartController {
         this.pos.y = g.height;
         this.vy = 0;
         this.grounded = true;
+        if (this.gliderActive) {
+          // canopy landing: soft touchdown + keep momentum (glide reward)
+          this.closeGlider();
+          if (this.speed > 14) this.applyBoost(0.5, 1.14);
+        }
         if (this.speed > 12) this.suspensionLand = Math.min(1.5, this.speed * 0.03);
         else this.suspensionLand = 0;
         // stunt landing: a completed trick pays a boost (MK8 style — lenient

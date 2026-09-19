@@ -147,7 +147,7 @@ export class AIDriver {
     // train instead of a 12-wide wall into corner 1.
     this.skill = 0.988 + this.rng() * 0.024;
     this.startSkill = this.rng();
-    this.stallEscapeOffset = this.rng() * 6;
+    this.stallEscapeOffset = this.rng() * 2.5;
   }
 
   /** Rubber-band speed multiplier from gap to the player. */
@@ -285,7 +285,7 @@ export class AIDriver {
     // glacier switchback deadlock) — serialize them by a random offset. A
     // LONE stalled kart (no slow neighbors) rescues immediately: the
     // stagger must never slow down individual recoveries.
-    if (this.gapStallT > 8 && !k.finished && this.wallowGrace <= 0) {
+    if (this.gapStallT > 5.5 && !k.finished && this.wallowGrace <= 0) {
       let stalledNeighbors = 0;
       for (const other of ctx.karts) {
         if (other === k || other.battleKo || other.finished) continue;
@@ -294,12 +294,12 @@ export class AIDriver {
         if (Math.abs(dS) < 15) stalledNeighbors++;
       }
       const stagger = stalledNeighbors >= 2 ? this.stallEscapeOffset : 0;
-      if (this.gapStallT > 8 + stagger) {
+      if (this.gapStallT > 5.5 + stagger) {
         k.requestRespawn = true;
         this.gapStallT = 0;
         this.stuckT = 0;
         this.offroadStallT = 0;
-        this.wallowGrace = 12;
+        this.wallowGrace = 7;
       }
     }
     const wallowing = !gi.onRoad && gi.onShortcut < 0 && !k.finished
@@ -307,11 +307,11 @@ export class AIDriver {
       && (speed < 6.5 || k.railGrindT > 6) && this.wallowGrace <= 0;
     if (wallowing) {
       this.offroadStallT += dt;
-      if (this.offroadStallT > 7 || k.railGrindT > 6) {
+      if (this.offroadStallT > 4.5 || k.railGrindT > 6) {
         k.requestRespawn = true;
         this.offroadStallT = 0;
         this.stuckT = 0;
-        this.wallowGrace = 12;
+        this.wallowGrace = 7;
       }
     } else {
       this.offroadStallT = Math.max(0, this.offroadStallT - dt * 2);

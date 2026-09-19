@@ -29,8 +29,8 @@ export function KartShowroom({ characterId, color, height = 300 }: {
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 60);
-    camera.position.set(3.6, 2.5, 5.2);
-    camera.lookAt(0, 0.75, 0);
+    camera.position.set(2.9, 1.95, 4.15);
+    camera.lookAt(0, 0.72, 0);
 
     // studio rig: warm key + cool rim + soft fill
     const key = new THREE.DirectionalLight(0xfff2d8, 1.55);
@@ -84,6 +84,7 @@ export function KartShowroom({ characterId, color, height = 300 }: {
       visual.update(dt, t, {
         speedRatio: 0, steer: Math.sin(t * 0.8) * 0.25, drifting: false, driftLevel: 0,
         grounded: true, boost: false, shrink: false, airborne: false, trickSpin: 0, trickKind: 0,
+        glider: 0, driftKick: 0,
       });
       renderer.render(scene, camera);
     };

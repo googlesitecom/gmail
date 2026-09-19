@@ -41,6 +41,6 @@ open(f'{ROOT}/.nojekyll', 'a').close()
 
 # 4) commit + push
 run('git add -A')
-run('git commit -m "APEX KART v4: musica de fondo + pistas 30% mas largas y unicas, gradas y terreno arreglados, saltos aterrizables, IA anti-atasco, FX de objetos" || true')
+run('git commit -m "APEX KART v5: personajes rediseñados (toon), cajas de objetos 3-en-fila, paracaidas en grandes saltos, derrape directo con ESPACIO (sin salto), HUD y menu rediseñados con escenario 3D, IA anti-atasco mejorada" || true')
 run('git push origin main')
 print('DEPLOYED')

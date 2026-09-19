@@ -21,6 +21,7 @@ import { CHARACTERS, CHARACTER_MAP } from '../karts/KartStats';
 import { KartController } from '../karts/KartController';
 import { KartVisual, type VisualModels } from '../karts/KartVisual';
 import { ModelLibrary } from '../assets/ModelLibrary';
+import { MenuStage } from '../fx/MenuStage';
 import { BattleWorld, TrackWorld } from '../tracks/TrackBuilder';
 import { ARENAS, CUPS, TRACKS } from '../tracks/TrackCatalog';
 import { AIDriver } from '../ai/AIDriver';
@@ -107,6 +108,8 @@ export class Game {
   private hudPublishAt = 0;
   private playerFinishAtMs = 0;
   private resultPublished = false;
+  /** live 3D showroom rendered behind the menus */
+  private menuStage: MenuStage | null = null;
   private fps = 0;
   private fpsFrames = 0;
   private fpsAt = 0;
@@ -160,6 +163,7 @@ export class Game {
     const savedOpts = SaveData.options;
     AudioSys.init({ music: savedOpts.musicVolume, sfx: savedOpts.sfxVolume });
     this.applyQuality(savedOpts.quality);
+    this.showMenuStage();
     window.addEventListener('resize', this.onResize);
     this.onResize();
     this.lastFrame = performance.now();
@@ -459,6 +463,7 @@ export class Game {
 
   startSession(cfg: SessionConfig): void {
     this.disposeSession();
+    this.hideMenuStage();
     this.session = cfg;
     this.resultPublished = false;
     this.playerFinishAtMs = 0;
@@ -738,7 +743,15 @@ export class Game {
       this.fpsFrames = 0;
       this.fpsAt = now;
     }
-    if (this.phase === 'idle' || !this.world) return;
+    if (this.phase === 'idle' || !this.world) {
+      // menus: keep the 3D showroom alive behind the UI
+      if (this.menuStage) {
+        this.menuStage.update(dtFrame);
+        this.composer.render();
+        this.framesRendered++;
+      }
+      return;
+    }
 
     this.input.poll(dtFrame);
     if (this.input.pausePressed && (this.phase === 'racing' || this.phase === 'countdown') && !this.resultPublished) {
@@ -1693,8 +1706,20 @@ export class Game {
         airborne: kart.airborne,
         trickSpin: kart.trickSpin,
         trickKind: kart.trickKind,
+        glider: kart.gliderActive ? kart.gliderDeploy : 0,
+        driftKick: kart.driftKick,
       });
       if (kart.suspensionLand > 0) { v.land(kart.suspensionLand); kart.suspensionLand = 0; }
+
+      // glider deployed: pop feedback for the player
+      if (kart.gliderOpened > 0) {
+        kart.gliderOpened = 0;
+        if (kart.isPlayer) {
+          this.camera.kick(0.35);
+          this.bridge.pushAnnouncer('¡PARACAÍDAS!', 'hype');
+          AudioSys.playGlider();
+        }
+      }
 
       // stunt landed clean: MK8-style payoff
       if (kart.trickLanded > 0) {
@@ -1866,49 +1891,97 @@ export class Game {
     const player = this.karts[0];
     if (!player) return;
     const W = ctx.canvas.width, H = ctx.canvas.height;
-    const cx = W / 2, cy = H / 2 + 8;
-    const R = Math.min(W, H) / 2 - 10;
+    const cx = W / 2, cy = H / 2 + 12;
+    const R = Math.min(W, H) / 2 + 6;
     ctx.clearRect(0, 0, W, H);
 
-    const ratio = Math.min(1.25, player.speedRatio / 1.0);
+    const boosting = player.boosting || player.starT > 0;
+    const ratio = Math.min(1, player.speedRatio / 1.0);
     const a0 = Math.PI * 0.75;
     const a1 = Math.PI * 2.25;
-    // background arc
+
+    // ---- dial face: dark bevel + glossy sweep -------------------------------
+    const face = ctx.createRadialGradient(cx, cy - 6, R * 0.2, cx, cy, R);
+    face.addColorStop(0, 'rgba(28,32,52,0.92)');
+    face.addColorStop(0.75, 'rgba(14,16,30,0.94)');
+    face.addColorStop(1, 'rgba(6,8,16,0.96)');
     ctx.beginPath();
-    ctx.arc(cx, cy, R, a0, a1);
-    ctx.lineWidth = 9;
-    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.fillStyle = face;
+    ctx.fill();
+    // rim
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = boosting ? '#ffb63a' : 'rgba(255,255,255,0.55)';
     ctx.stroke();
-    // speed arc
-    const aSpeed = a0 + (a1 - a0) * Math.min(1, ratio);
+    // gloss (upper-left crescent)
     ctx.beginPath();
-    ctx.arc(cx, cy, R, a0, aSpeed);
-    ctx.lineWidth = 9;
-    ctx.strokeStyle = player.boosting || player.starT > 0 ? '#ffb63a' : '#5affc8';
+    ctx.arc(cx, cy, R - 5, Math.PI * 0.95, Math.PI * 1.55);
+    ctx.lineWidth = 5;
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.stroke();
+
+    // ---- speed arc: green -> amber -> red -------------------------------------
+    const aSpeed = a0 + (a1 - a0) * ratio;
+    const arcCol = ratio > 0.85 ? '#ff5a6e' : ratio > 0.6 ? '#ffb63a' : '#5affc8';
+    ctx.save();
+    if (boosting) { ctx.shadowColor = '#ffb63a'; ctx.shadowBlur = 12; }
+    ctx.beginPath();
+    ctx.arc(cx, cy, R - 10, a0, aSpeed);
+    ctx.lineWidth = 7;
     ctx.lineCap = 'round';
+    ctx.strokeStyle = boosting ? '#ffd23a' : arcCol;
     ctx.stroke();
-    // ticks
+    ctx.restore();
+
+    // ---- ticks ------------------------------------------------------------------
     for (let i = 0; i <= 8; i++) {
       const a = a0 + (a1 - a0) * (i / 8);
+      const major = i % 2 === 0;
       ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(a) * (R - 12), cy + Math.sin(a) * (R - 12));
-      ctx.lineTo(cx + Math.cos(a) * (R - 18), cy + Math.sin(a) * (R - 18));
-      ctx.lineWidth = 2;
-      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      ctx.moveTo(cx + Math.cos(a) * (R - 16), cy + Math.sin(a) * (R - 16));
+      ctx.lineTo(cx + Math.cos(a) * (R - (major ? 24 : 21)), cy + Math.sin(a) * (R - (major ? 24 : 21)));
+      ctx.lineWidth = major ? 2.5 : 1.5;
+      ctx.strokeStyle = major ? 'rgba(255,255,255,0.75)' : 'rgba(255,255,255,0.3)';
       ctx.stroke();
     }
-    // digital readout
-    ctx.fillStyle = '#ffffff';
-    ctx.font = 'bold 22px monospace';
+
+    // ---- needle -------------------------------------------------------------------
+    const na = a0 + (a1 - a0) * Math.max(0.02, ratio);
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(na);
+    ctx.beginPath();
+    ctx.moveTo(-4, 0);
+    ctx.lineTo(R - 26, -2.6);
+    ctx.lineTo(R - 20, 0);
+    ctx.lineTo(R - 26, 2.6);
+    ctx.closePath();
+    ctx.fillStyle = boosting ? '#ffd23a' : '#ff4a5e';
+    ctx.shadowColor = 'rgba(0,0,0,0.5)';
+    ctx.shadowBlur = 3;
+    ctx.fill();
+    ctx.restore();
+    // hub
+    ctx.beginPath();
+    ctx.arc(cx, cy, 5.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#e8ecf6';
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = '#1a1e2e';
+    ctx.stroke();
+
+    // ---- digital readout ---------------------------------------------------------
     ctx.textAlign = 'center';
-    ctx.fillText(`${Math.round(player.speedKmh)}`, cx, cy + 2);
-    ctx.font = '10px sans-serif';
-    ctx.fillStyle = 'rgba(255,255,255,0.6)';
-    ctx.fillText('km/h', cx, cy + 16);
-    if (player.boosting) {
-      ctx.fillStyle = '#ffb63a';
-      ctx.font = 'bold 11px sans-serif';
-      ctx.fillText('TURBO', cx, cy - R + 18);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '900 21px "Arial Black", Arial, sans-serif';
+    ctx.fillText(`${Math.round(player.speedKmh)}`, cx, cy + 30);
+    ctx.font = '700 9px "Arial Black", Arial, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+    ctx.fillText('KM/H', cx, cy + 41);
+    if (boosting) {
+      ctx.fillStyle = '#ffd23a';
+      ctx.font = '900 10px "Arial Black", Arial, sans-serif';
+      ctx.fillText('¡TURBO!', cx, cy - R + 22);
     }
   }
 
@@ -1926,7 +1999,32 @@ export class Game {
   quitToMenu(): void {
     this.disposeSession();
     this.phase = 'idle';
+    this.showMenuStage();
     this.bridge.resetToMenu();
+  }
+
+  /** Build (once) and reveal the 3D menu showroom + its lighting. */
+  private showMenuStage(): void {
+    if (!this.menuStage) {
+      this.menuStage = new MenuStage(this.camera.camera);
+      this.scene.add(this.menuStage.group);
+    }
+    this.menuStage.group.visible = true;
+    this.scene.fog = null;
+    this.scene.background = null;
+    // warm sunset showroom rig (startSession installs its own per-theme rig)
+    this.sun.position.set(-18, 26, 14);
+    this.sun.color.setHex(0xffe2b8);
+    this.sun.intensity = 3.1;
+    this.hemi.color.setHex(0xb8a8ff);
+    this.hemi.groundColor.setHex(0x1a1030);
+    this.hemi.intensity = 1.6;
+    this.ambient.intensity = 0.55;
+    this.renderer.toneMappingExposure = 1.12;
+  }
+
+  private hideMenuStage(): void {
+    if (this.menuStage) this.menuStage.group.visible = false;
   }
 
   private disposeSession(): void {

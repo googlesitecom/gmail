@@ -64,6 +64,14 @@ export const PHYS = {
   trickBoostTime: 0.85,
   trickBoostPower: 1.32,
 
+  // --- glider / parachute (MK7/8-style: big air => canopy opens) ---------------
+  gliderDeployVy: -11.5,    // falling at least this fast to auto-open
+  gliderMinHeight: 5.5,     // ...and at least this high above the ground
+  gliderGravityMul: 0.30,   // descent strongly slowed under canopy
+  gliderFallCap: -6.0,      // terminal glide speed (m/s)
+  gliderSteer: 0.95,        // steering authority while gliding (vs 0.55 raw air)
+  gliderOpenTime: 0.28,     // canopy pop animation (s)
+
   // --- offroad --------------------------------------------------------------
   offroadDrag: 3.2,         // strong damping off the road
   offroadMaxFactor: 0.55,   // speed clamp factor while offroad

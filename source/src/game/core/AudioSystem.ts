@@ -112,6 +112,40 @@ class AudioSystemImpl {
     });
   }
 
+  /**
+   * Glider/parachute deploy — a synthesized canvas-snatch whoosh (filtered
+   * noise sweep). No asset needed; pure WebAudio so it always loads.
+   */
+  playGlider(): void {
+    if (this.volumes.sfx <= 0) return;
+    if (!this.ctx) this.ensureCtx();
+    if (!this.ctx || this.ctx.state !== 'running') return;
+    try {
+      const dur = 0.55;
+      const sr = this.ctx.sampleRate;
+      const buf = this.ctx.createBuffer(1, Math.floor(sr * dur), sr);
+      const data = buf.getChannelData(0);
+      for (let i = 0; i < data.length; i++) {
+        const t = i / data.length;
+        // noise with a rising envelope then soft decay
+        data[i] = (Math.random() * 2 - 1) * Math.sin(Math.min(1, t * 4) * Math.PI) * (1 - t * 0.55);
+      }
+      const src = this.ctx.createBufferSource();
+      src.buffer = buf;
+      const filt = this.ctx.createBiquadFilter();
+      filt.type = 'bandpass';
+      filt.frequency.setValueAtTime(500, this.ctx.currentTime);
+      filt.frequency.exponentialRampToValueAtTime(2600, this.ctx.currentTime + 0.28);
+      filt.Q.value = 1.1;
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.0001, this.ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.5 * this.volumes.sfx, this.ctx.currentTime + 0.07);
+      g.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + dur);
+      src.connect(filt).connect(g).connect(this.sfxGain ?? this.ctx.destination);
+      src.start();
+    } catch { /* synthesized — nothing to fall back to */ }
+  }
+
   private ensureCtx(): void {
     if (this.ctx || typeof AudioContext === 'undefined') return;
     try {

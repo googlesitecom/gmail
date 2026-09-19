@@ -122,46 +122,29 @@
 }
 
 /* ================================================================ APEX KART
- * Arcade racing design system: italic display type, skewed action buttons,
- * checkered strips, animated speed-lines background and glass panels.
+ * Arcade racing design system v2 — "night showroom": the 3D stage renders
+ * behind the menus, so panels are translucent glass; buttons are chunky
+ * toy-like pills; type is Bungee (display) + Baloo 2 (body).
  */
 
+/* display face for the logo / headlines / big numbers */
 .apex-font {
-  font-family: 'Arial Black', 'Segoe UI Black', 'Impact', system-ui, sans-serif;
-  font-weight: 900;
-  font-style: italic;
-  letter-spacing: -0.01em;
+  font-family: var(--font-display), 'Arial Black', 'Segoe UI Black', Impact, system-ui, sans-serif;
+  font-weight: 400;
+  letter-spacing: 0.01em;
 }
 
-/* animated diagonal speed-lines over a deep night gradient */
+/* rounded UI face for labels / body */
+.apex-ui {
+  font-family: var(--font-body), 'Segoe UI', system-ui, sans-serif;
+}
+
+/* ---- menu scrim: darkens top & bottom so the live 3D showroom breathes
+ * through the middle band. Replaces the old opaque gradient. */
 .apex-bg {
   background:
-    radial-gradient(1100px 620px at 50% -12%, rgba(255, 180, 60, 0.16), transparent 62%),
-    radial-gradient(900px 520px at 88% 110%, rgba(64, 118, 255, 0.18), transparent 60%),
-    linear-gradient(180deg, #150b26 0%, #0b0816 46%, #07060f 100%);
-}
-.apex-bg::before {
-  content: '';
-  position: fixed;
-  inset: -40%;
-  pointer-events: none;
-  background: repeating-linear-gradient(
-    115deg,
-    transparent 0 46px,
-    rgba(255, 255, 255, 0.025) 46px 52px
-  );
-  animation: apex-stripes 1.4s linear infinite;
-}
-.apex-bg::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background: radial-gradient(120% 90% at 50% 50%, transparent 55%, rgba(0, 0, 0, 0.55) 100%);
-}
-@keyframes apex-stripes {
-  from { transform: translate3d(0, 0, 0); }
-  to   { transform: translate3d(0, 118px, 0); }
+    radial-gradient(120% 90% at 50% 50%, transparent 40%, rgba(4, 4, 12, 0.5) 100%),
+    linear-gradient(180deg, rgba(5, 4, 14, 0.88) 0%, rgba(5, 4, 14, 0.35) 22%, rgba(5, 4, 14, 0.25) 62%, rgba(5, 4, 14, 0.88) 100%);
 }
 
 /* checkered flag strip */
@@ -175,38 +158,43 @@
   mask-image: linear-gradient(90deg, transparent, black 14%, black 86%, transparent);
 }
 
-/* big italic display title with layered hard shadow */
+/* big chrome-gold logo with layered hard shadow */
 .apex-title {
   line-height: 0.92;
-  color: #ffe94a;
-  text-shadow:
-    0 2px 0 #ff9a3a,
-    0 5px 0 #e8324a,
-    0 9px 0 rgba(0, 0, 0, 0.45),
-    0 14px 34px rgba(232, 50, 74, 0.45);
+  background: linear-gradient(180deg, #fffbe8 6%, #ffe94a 34%, #ffb02a 58%, #ff6a3a 88%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-stroke: 2px #2a1030;
+  paint-order: stroke fill;
+  filter:
+    drop-shadow(0 3px 0 rgba(160, 40, 60, 0.9))
+    drop-shadow(0 7px 0 rgba(0, 0, 0, 0.4))
+    drop-shadow(0 16px 30px rgba(255, 140, 60, 0.35));
   transform: skewX(-6deg);
 }
 
-/* skewed action button with shine sweep */
+/* chunky toy button: pill, thick base, hover lift + glow */
 .apex-btn {
   position: relative;
   overflow: hidden;
-  transform: skewX(-8deg);
   transition: transform 0.16s cubic-bezier(0.2, 0.9, 0.3, 1.4), box-shadow 0.16s ease, filter 0.16s ease;
-  box-shadow: 0 6px 0 rgba(0, 0, 0, 0.38), 0 12px 30px rgba(0, 0, 0, 0.35);
+  box-shadow:
+    inset 0 2px 0 rgba(255, 255, 255, 0.35),
+    inset 0 -3px 0 rgba(0, 0, 0, 0.3),
+    0 5px 0 rgba(0, 0, 0, 0.45),
+    0 12px 26px rgba(0, 0, 0, 0.4);
 }
-.apex-btn > * { transform: skewX(8deg); }
 .apex-btn::after {
   content: '';
   position: absolute;
   top: 0; bottom: 0; left: -70%;
   width: 45%;
   background: linear-gradient(100deg, transparent, rgba(255, 255, 255, 0.4), transparent);
-  transform: skewX(-16deg);
   animation: apex-shine 2.8s ease-in-out infinite;
 }
-.apex-btn:hover { transform: skewX(-8deg) translateY(-3px) scale(1.025); filter: brightness(1.07); }
-.apex-btn:active { transform: skewX(-8deg) translateY(1px) scale(0.98); }
+.apex-btn:hover { transform: translateY(-3px) scale(1.03); filter: brightness(1.09) saturate(1.1); }
+.apex-btn:active { transform: translateY(1px) scale(0.985); filter: brightness(0.96); }
 @keyframes apex-shine {
   0%, 55% { left: -70%; }
   85%, 100% { left: 130%; }
@@ -214,8 +202,8 @@
 
 /* glass panel with one clipped corner */
 .apex-panel {
-  background: linear-gradient(160deg, rgba(22, 16, 38, 0.86), rgba(10, 8, 20, 0.9));
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  background: linear-gradient(160deg, rgba(22, 16, 38, 0.72), rgba(10, 8, 20, 0.82));
+  border: 1px solid rgba(255, 255, 255, 0.12);
   clip-path: polygon(0 0, calc(100% - 18px) 0, 100% 18px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
   backdrop-filter: blur(6px);
 }
@@ -233,3 +221,22 @@
   50% { opacity: 0.7; box-shadow: 0 0 0 9px rgba(255, 233, 74, 0); }
 }
 .apex-pulse { animation: apex-pulse 1.9s ease-in-out infinite; }
+
+/* outlined game text (HUD numbers & chips read over any scene) */
+.apex-outline {
+  -webkit-text-stroke: 3px rgba(10, 8, 20, 0.85);
+  paint-order: stroke fill;
+  text-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
+}
+
+/* boost speed-lines overlay */
+.apex-speedlines {
+  background:
+    radial-gradient(ellipse 42% 34% at 50% 50%, transparent 55%, rgba(255, 190, 80, 0.16) 100%),
+    repeating-conic-gradient(from 0deg at 50% 50%, rgba(255, 255, 255, 0.05) 0deg 1.2deg, transparent 1.2deg 7deg);
+  animation: apex-lines-spin 0.9s linear infinite;
+}
+@keyframes apex-lines-spin {
+  from { transform: rotate(0deg) scale(1.05); }
+  to { transform: rotate(7deg) scale(1.05); }
+}

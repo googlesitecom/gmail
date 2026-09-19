@@ -1,0 +1,709 @@
+     1→/**
+     2→ * APEX KART — Item runtime: roulettes, orbiting shields, projectiles,
+     3→ * traps, global effects and their 3D representations.
+     4→ * The system is world-agnostic: works on circuits and battle arenas.
+     5→ */
+     6→
+     7→import * as THREE from 'three';
+     8→import { ItemId, KartControls } from '../core/Types';
+     9→import { KartController, StepWorld } from '../karts/KartController';
+    10→import { ITEMS, PHYS } from '../core/Config';
+    11→import { clamp } from '../core/MathUtils';
+    12→import { ITEM_MAP, rollItem } from './ItemData';
+    13→import { mat } from '../tracks/Decorations';
+    14→
+    15→type ProjKind = 'dart' | 'seeker' | 'hunter' | 'magnet';
+    16→
+    17→interface Projectile {
+    18→  kind: ProjKind;
+    19→  mesh: THREE.Object3D;
+    20→  owner: KartController;
+    21→  target: KartController | null;
+    22→  pos: THREE.Vector3;
+    23→  vel: THREE.Vector3;
+    24→  s?: number;            // hunter: track progress
+    25→  life: number;
+    26→  speed: number;
+    27→  active: boolean;
+    28→  replica: boolean;      // net: spawned from a peer event — only hits LOCAL karts
+    29→}
+    30→
+    31→interface TrapEntity {
+    32→  mesh: THREE.Object3D;
+    33→  pos: THREE.Vector3;
+    34→  owner: KartController;
+    35→  life: number;
+    36→  kind: 'goo' | 'mine';
+    37→  armed: number;         // ignore owner for this long
+    38→  active: boolean;
+    39→  replica: boolean;
+    40→  s: number;             // track s (0..1) at drop — AI dodge without projection
+    41→  lat: number;           // lateral offset (m) at drop
+    42→}
+    43→
+    44→export interface ItemEvent {
+    45→  type: 'fire' | 'hit' | 'shield' | 'steal' | 'storm' | 'roulette' | 'box' | 'nethit';
+    46→  kartId: string;
+    47→  itemId?: ItemId;
+    48→  ownerId?: string;      // who fired the thing that hit (net broadcast)
+    49→  targetId?: string;     // 'steal'/'nethit': the affected kart
+    50→  text?: string;
+    51→  /** hit-family visual signature: 'zap' | 'seeker' | 'blast' | 'goo' | 'storm' */
+    52→  fx?: string;
+    53→}
+    54→
+    55→export class ItemSystem {
+    56→  readonly group = new THREE.Group();
+    57→  /** battle mode: storm/magnet only affect the enemy team */
+    58→  teamMode = false;
+    59→  /** online: replica projectiles/traps only collide with karts in this set */
+    60→  netMode = false;
+    61→  localKartIds: Set<string> | null = null;
+    62→  /** last useItem() `behind` flag (net broadcast reads it after the fire event) */
+    63→  lastFireBehind = false;
+    64→  /** consulted when a roulette resolves: should the item start HELD behind the kart? */
+    65→  holdIntent: ((kart: KartController) => boolean) | null = null;
+    66→  private projectiles: Projectile[] = [];
+    67→  private traps: TrapEntity[] = [];
+    68→  private orbiters = new Map<string, THREE.Object3D[]>(); // kartId -> shield meshes
+    69→  private heldMeshes = new Map<string, { mesh: THREE.Object3D; itemId: string }>();
+    70→  private rng: () => number;
+    71→  private world: StepWorld & { spline?: import('../tracks/Spline').Spline };
+    72→  private karts: KartController[];
+    73→  onEvent: ((e: ItemEvent) => void) | null = null;
+    74→
+    75→  constructor(world: StepWorld & { spline?: import('../tracks/Spline').Spline }, karts: KartController[], seed = 9001) {
+    76→    this.world = world;
+    77→    this.karts = karts;
+    78→    let a = seed >>> 0;
+    79→    this.rng = () => {
+    80→      a |= 0; a = (a + 0x6D2B79F5) | 0;
+    81→      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    82→      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    83→      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    84→    };
+    85→  }
+    86→
+    87→  /** QA: live projectile/trap counts. */
+    88→  get activeProjectiles(): number { return this.projectiles.length; }
+    89→  get activeTraps(): number { return this.traps.length; }
+    90→  /** live goo/mines in track coordinates — consumed by the AI to dodge */
+    91→  get trapHazards(): { s: number; lat: number; ownerId: string }[] {
+    92→    return this.traps.filter(tr => tr.active).map(tr => ({ s: tr.s, lat: tr.lat, ownerId: tr.owner.id }));
+    93→  }
+    94→
+    95→  // -------------------------------------------------------------- roulette
+    96→
+    97→  /** Box picked up: start the HUD roulette if the slot is free.
+    98→   *  Golden double boxes also roll a second item into the spare slot. */
+    99→  giveRoulette(kart: KartController, double = false): boolean {
+   100→    if (kart.itemSlot) return false;
+   101→    kart.rouletteUntil = performance.now() + ITEMS.rouletteTimeMs;
+   102→    if (double && !kart.itemSlot2) {
+   103→      kart.rouletteUntil2 = kart.rouletteUntil + 160;   // second roll lands just after
+   104→    }
+   105→    this.onEvent?.({ type: 'roulette', kartId: kart.id });
+   106→    return true;
+   107→  }
+   108→
+   109→  /** Resolves pending roulettes into actual items. */
+   110→  updateRoulettes(): void {
+   111→    const now = performance.now();
+   112→    for (const k of this.karts) {
+   113→      if (k.rouletteUntil > 0 && now >= k.rouletteUntil) {
+   114→        k.rouletteUntil = 0;
+   115→        // battle has no live ranking — use the balanced mid-pack table
+   116→        const rank = this.teamMode ? 6 : Math.max(0, k.rank - 1);
+   117→        const item = rollItem(rank, this.rng);
+   118→        k.itemSlot = item;
+   119→        k.itemCharges = item === 'triple_dart' ? 3 : item === 'turbo_stack' ? 3 : 1;
+   120→        // MK-style: holding the item button while the roulette resolves keeps
+   121→        // the item trailing behind the kart as a rear shield
+   122→        if (k.itemSlot && this.holdIntent?.(k)) k.itemHeldOut = true;
+   123→      }
+   124→      if (k.rouletteUntil2 > 0 && now >= k.rouletteUntil2) {
+   125→        k.rouletteUntil2 = 0;
+   126→        const rank = this.teamMode ? 6 : Math.max(0, k.rank - 1);
+   127→        const item2 = rollItem(rank, this.rng);
+   128→        if (!k.itemSlot2) {
+   129→          k.itemSlot2 = item2;
+   130→          k.itemCharges2 = item2 === 'triple_dart' ? 3 : item2 === 'turbo_stack' ? 3 : 1;
+   131→        }
+   132→      }
+   133→    }
+   134→  }
+   135→
+   136→  // -------------------------------------------------------------- use item
+   137→
+   138→  /**
+   139→   * Fire/use the kart's item.
+   140→   * `behind` = throw traps backwards or shoot rearwards (look-back held).
+   141→   */
+   142→  useItem(kart: KartController, behind: boolean): boolean {
+   143→    const id = kart.itemSlot as ItemId | null;
+   144→    if (!id || kart.rouletteUntil > 0 || kart.spinT > 0) return false;
+   145→    const def = ITEM_MAP[id];
+   146→    this.lastFireBehind = behind;
+   147→    kart.itemHeldOut = false;
+   148→
+   149→    switch (id) {
+   150→      case 'photon_dart':
+   151→        this.spawnDart(kart, behind);
+   152→        break;
+   153→      case 'seeker_orb':
+   154→        this.spawnSeeker(kart);
+   155→        break;
+   156→      case 'triple_dart':
+   157→        this.spawnDart(kart, behind);
+   158→        break;
+   159→      case 'goo_trap':
+   160→        this.dropTrap(kart, 'goo', behind);
+   161→        break;
+   162→      case 'rear_mine':
+   163→        this.dropTrap(kart, 'mine', true);
+   164→        break;
+   165→      case 'turbo_cell':
+   166→        kart.applyBoost(1.3, 1.45);
+   167→        break;
+   168→      case 'turbo_stack':
+   169→        kart.applyBoost(1.3, 1.5);
+   170→        break;
+   171→      case 'star_core':
+   172→        kart.starT = PHYS.starTime;
+   173→        break;
+   174→      case 'orbit_shield':
+   175→        kart.orbitShield = ITEMS.orbitBlocks;
+   176→        break;
+   177→      case 'aegis_star':
+   178→        kart.aegisT = PHYS.aegisTime;
+   179→        break;
+   180→      case 'storm_chip':
+   181→        this.stormBlast(kart);
+   182→        break;
+   183→      case 'track_hunter':
+   184→        this.spawnHunter(kart);
+   185→        break;
+   186→      case 'magnet_drone':
+   187→        this.spawnMagnet(kart);
+   188→        break;
+   189→    }
+   190→
+   191→    kart.itemCharges -= 1;
+   192→    if (kart.itemCharges <= 0) {
+   193→      // golden-box flow: the spare slot slides into the main slot
+   194→      if (kart.itemSlot2) {
+   195→        kart.itemSlot = kart.itemSlot2 as ItemId;
+   196→        kart.itemCharges = kart.itemCharges2;
+   197→        kart.itemSlot2 = null;
+   198→        kart.itemCharges2 = 0;
+   199→      } else {
+   200→        kart.itemSlot = null;
+   201→        kart.itemCharges = 0;
+   202→      }
+   203→    }
+   204→    this.onEvent?.({ type: 'fire', kartId: kart.id, itemId: id, text: def.name });
+   205→    return true;
+   206→  }
+   207→
+   208→  // -------------------------------------------------------------- spawns
+   209→
+   210→  private kartAhead(owner: KartController): KartController | null {
+   211→    if (this.teamMode) {
+   212→      // nearest enemy kart
+   213→      let best: KartController | null = null;
+   214→      let bestD = Infinity;
+   215→      for (const k of this.karts) {
+   216→        if (k === owner || k.battleKo || k.battleTeam === owner.battleTeam) continue;
+   217→        const d = k.pos.distanceToSquared(owner.pos);
+   218→        if (d < bestD) { bestD = d; best = k; }
+   219→      }
+   220→      return best;
+   221→    }
+   222→    // race: kart with rank == owner.rank - 1
+   223→    const target = this.karts.find(k => k !== owner && k.rank === owner.rank - 1 && !k.battleKo);
+   224→    return target ?? null;
+   225→  }
+   226→
+   227→  private spawnDart(owner: KartController, behind: boolean, replica = false): void {
+   228→    const dir = behind ? owner.forward().negate() : owner.forward();
+   229→    const mesh = new THREE.Group();
+   230→    const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.22, 0.7, 4, 8), mat(0x35e0ff, { emissive: 0x1188aa }));
+   231→    body.rotation.x = Math.PI / 2;
+   232→    mesh.add(body);
+   233→    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.5, 8), mat(0xffffff, { emissive: 0x668899 }));
+   234→    nose.rotation.x = Math.PI / 2; nose.position.z = 0.6;
+   235→    mesh.add(nose);
+   236→    mesh.position.copy(owner.pos).addScaledVector(dir, 1.6).add(new THREE.Vector3(0, 0.8, 0));
+   237→    mesh.lookAt(mesh.position.clone().add(dir));
+   238→    this.group.add(mesh);
+   239→    this.projectiles.push({
+   240→      kind: 'dart', mesh, owner, target: null,
+   241→      pos: mesh.position.clone(), vel: dir.clone().multiplyScalar(ITEMS.projectileSpeed),
+   242→      life: 5, speed: ITEMS.projectileSpeed, active: true, replica,
+   243→    });
+   244→  }
+   245→
+   246→  private spawnSeeker(owner: KartController, replica = false): void {
+   247→    const target = this.kartAhead(owner);
+   248→    const mesh = new THREE.Group();
+   249→    const orb = new THREE.Mesh(new THREE.SphereGeometry(0.42, 10, 8), mat(0xff5ad8, { emissive: 0x881155 }));
+   250→    mesh.add(orb);
+   251→    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.6, 0.07, 6, 14), mat(0xffffff, { emissive: 0x886688 }));
+   252→    mesh.add(ring);
+   253→    mesh.position.copy(owner.pos).addScaledVector(owner.forward(), 1.6).add(new THREE.Vector3(0, 1.0, 0));
+   254→    this.group.add(mesh);
+   255→    this.projectiles.push({
+   256→      kind: 'seeker', mesh, owner, target,
+   257→      pos: mesh.position.clone(), vel: owner.forward().clone().multiplyScalar(30),
+   258→      life: 8, speed: 34, active: true, replica,
+   259→    });
+   260→  }
+   261→
+   262→  private spawnHunter(owner: KartController, replica = false): void {
+   263→    const target = this.kartAhead(owner);
+   264→    const mesh = new THREE.Group();
+   265→    const rocket = new THREE.Mesh(new THREE.ConeGeometry(0.35, 1.4, 8), mat(0xff7a2a, { emissive: 0x883300 }));
+   266→    rocket.rotation.x = Math.PI / 2;
+   267→    mesh.add(rocket);
+   268→    const fin1 = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.5, 0.4), mat(0xe84a3a));
+   269→    fin1.position.set(0, 0.25, -0.5); mesh.add(fin1);
+   270→    const fin2 = fin1.clone(); fin2.rotation.z = Math.PI / 2; mesh.add(fin2);
+   271→    // spawn behind the owner, on the track
+   272→    const sStart = owner.progressS;
+   273→    const sm = this.world.spline?.sampleAt(sStart);
+   274→    mesh.position.copy(sm ? sm.pos.clone().add(new THREE.Vector3(0, 0.8, 0)) : owner.pos.clone());
+   275→    this.group.add(mesh);
+   276→    this.projectiles.push({
+   277→      kind: 'hunter', mesh, owner, target,
+   278→      pos: mesh.position.clone(), vel: new THREE.Vector3(),
+   279→      s: owner.progressS, life: 12, speed: ITEMS.hunterSpeed, active: true, replica,
+   280→    });
+   281→  }
+   282→
+   283→  private spawnMagnet(owner: KartController, replica = false): void {
+   284→    const target = this.kartAhead(owner);
+   285→    const mesh = new THREE.Group();
+   286→    const horseshoe = new THREE.Mesh(new THREE.TorusGeometry(0.4, 0.14, 6, 10, Math.PI), mat(0xd8d84a));
+   287→    mesh.add(horseshoe);
+   288→    const drone = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.16, 0.5), mat(0x444450));
+   289→    drone.position.y = 0.5; mesh.add(drone);
+   290→    mesh.position.copy(owner.pos).add(new THREE.Vector3(0, 2.2, 0));
+   291→    this.group.add(mesh);
+   292→    this.projectiles.push({
+   293→      kind: 'magnet', mesh, owner, target,
+   294→      pos: mesh.position.clone(), vel: new THREE.Vector3(),
+   295→      life: 6, speed: ITEMS.magnetSpeed, active: true, replica,
+   296→    });
+   297→  }
+   298→
+   299→  private dropTrap(owner: KartController, kind: 'goo' | 'mine', behind: boolean, replica = false): void {
+   300→    const dir = behind ? owner.forward().negate() : owner.forward();
+   301→    const mesh = kind === 'goo'
+   302→      ? new THREE.Mesh(new THREE.CylinderGeometry(1.15, 1.35, 0.22, 10), mat(0x8a4ae8, { emissive: 0x221144 }))
+   303→      : (() => {
+   304→        const g = new THREE.Group();
+   305→        const ball = new THREE.Mesh(new THREE.IcosahedronGeometry(0.5, 0), mat(0x222228));
+   306→        g.add(ball);
+   307→        const blink = new THREE.Mesh(new THREE.SphereGeometry(0.16, 6, 5), mat(0xff4422, { emissive: 0xaa1100 }));
+   308→        blink.position.y = 0.45; g.add(blink);
+   309→        return g;
+   310→      })();
+   311→    const dropDist = kind === 'goo' ? (behind ? -2.2 : 2.6) : -3.4;
+   312→    const pos = owner.pos.clone().addScaledVector(dir, Math.abs(dropDist));
+   313→    pos.y += 0.12;
+   314→    mesh.position.copy(pos);
+   315→    this.group.add(mesh);
+   316→    // track-relative placement for AI dodging (drop offset along the road)
+   317→    const spLen = this.world.spline?.length ?? 1000;
+   318→    const dropS = (owner.progressS ?? 0) + dropDist / spLen;
+   319→    this.traps.push({
+   320→      mesh, pos, owner, kind,
+   321→      life: kind === 'goo' ? ITEMS.trapLife : ITEMS.mineLife,
+   322→      armed: 0.6, active: true, replica,
+   323→      s: dropS - Math.floor(dropS),
+   324→      lat: owner.ginfo?.lateral ?? 0,
+   325→    });
+   326→  }
+   327→
+   328→  // -------------------------------------------------------------- net replication
+   329→
+   330→  /**
+   331→   * Net: a peer fired an item — replicate it from the peer's puppet pose so
+   332→   * the visuals + local-kart collisions match the owner's simulation.
+   333→   * Replica projectiles only ever hit LOCAL karts (each client owns its fate);
+   334→   * hits on remote victims are broadcast by the firing client instead.
+   335→   */
+   336→  netUseItem(owner: KartController, itemId: ItemId, behind: boolean): void {
+   337→    switch (itemId) {
+   338→      case 'photon_dart':
+   339→      case 'triple_dart':
+   340→        this.spawnDart(owner, behind, true);
+   341→        break;
+   342→      case 'seeker_orb':
+   343→        this.spawnSeeker(owner, true);
+   344→        break;
+   345→      case 'goo_trap':
+   346→        this.dropTrap(owner, 'goo', behind, true);
+   347→        break;
+   348→      case 'rear_mine':
+   349→        this.dropTrap(owner, 'mine', true, true);
+   350→        break;
+   351→      case 'track_hunter':
+   352→        this.spawnHunter(owner, true);
+   353→        break;
+   354→      case 'magnet_drone':
+   355→        this.spawnMagnet(owner, true);
+   356→        break;
+   357→      // self-buff items (boost/star/aegis/shield) are pure state flags —
+   358→      // they arrive with the peer's state stream, nothing to replicate here.
+   359→      default:
+   360→        break;
+   361→    }
+   362→  }
+   363→
+   364→  /** Net: does this projectile/trap get to collide with the given kart? */
+   365→  private canHit(k: KartController, replica: boolean): boolean {
+   366→    if (!replica) return true;
+   367→    if (!this.netMode) return true;   // offline: everything collides
+   368→    return this.localKartIds?.has(k.id) ?? false;
+   369→  }
+   370→
+   371→  private stormBlast(owner: KartController): void {
+   372→    for (const k of this.karts) {
+   373→      if (k === owner || k.battleKo || k.finished) continue;
+   374→      if (this.teamMode && k.battleTeam === owner.battleTeam) continue;
+   375→      if (k.invincible) continue;
+   376→      k.shrinkNow();
+   377→      k.spinT = Math.min(k.spinT + 0.6, PHYS.spinTime);
+   378→      k.speed *= 0.5;
+   379→    }
+   380→    this.onEvent?.({ type: 'storm', kartId: owner.id, text: '¡Chip Tormenta!' });
+   381→  }
+   382→
+   383→  // -------------------------------------------------------------- update
+   384→
+   385→  update(dt: number, t: number, racing: boolean): void {
+   386→    this.updateRoulettes();
+   387→    this.updateProjectiles(dt, t);
+   388→    this.updateTraps(dt, t);
+   389→    this.updateOrbiters(t);
+   390→    this.updateHeldItems(t);
+   391→  }
+   392→
+   393→  // -------------------------------------------------------------- held-behind item
+   394→
+   395→  /** True when the kart is holding an item behind AND the impact position is
+   396→   *  in its rear arc — the item blocks the shot and is NOT consumed. */
+   397→  private tryRearBlock(k: KartController, sourcePos: THREE.Vector3): boolean {
+   398→    if (!k.itemHeldOut || !k.itemSlot) return false;
+   399→    const f = k.forward();
+   400→    const to = sourcePos.clone().sub(k.pos).normalize();
+   401→    return f.dot(to) < -0.25;                    // impact comes from behind
+   402→  }
+   403→
+   404→  /** Trailing item visual: the current item floats ~2.3 m behind the kart. */
+   405→  private updateHeldItems(t: number): void {
+   406→    for (const k of this.karts) {
+   407→      const held = this.heldMeshes.get(k.id);
+   408→      // remote puppets stream the held flag but not the item id — show generic
+   409→      const want = k.itemHeldOut && (!!k.itemSlot || k.remoteDriven);
+   410→      if (want && (!held || held.itemId !== (k.itemSlot ?? '?'))) {
+   411→        if (held) { this.group.remove(held.mesh); }
+   412→        const mesh = this.buildHeldMesh((k.itemSlot ?? 'aegis_star') as ItemId);
+   413→        this.group.add(mesh);
+   414→        this.heldMeshes.set(k.id, { mesh, itemId: (k.itemSlot ?? '?') as string });
+   415→      } else if (!want && held) {
+   416→        this.group.remove(held.mesh);
+   417→        this.heldMeshes.delete(k.id);
+   418→      }
+   419→      if (!want) continue;
+   420→      const m = this.heldMeshes.get(k.id)!.mesh;
+   421→      const back = k.forward().multiplyScalar(-1);
+   422→      m.position.copy(k.pos).addScaledVector(back, 2.3);
+   423→      m.position.y = k.pos.y + 0.9 + Math.sin(t * 4) * 0.08;
+   424→      m.rotation.y = k.yaw + Math.PI + Math.sin(t * 2) * 0.15;
+   425→      m.rotation.z = Math.sin(t * 3) * 0.12;
+   426→    }
+   427→  }
+   428→
+   429→  private buildHeldMesh(id: ItemId): THREE.Object3D {
+   430→    const g = new THREE.Group();
+   431→    const halo = new THREE.Mesh(
+   432→      new THREE.SphereGeometry(0.55, 10, 8),
+   433→      new THREE.MeshBasicMaterial({ color: 0x9adfff, transparent: true, opacity: 0.18 }));
+   434→    g.add(halo);
+   435→    const inner = new THREE.Mesh(new THREE.IcosahedronGeometry(0.3, 0), mat(0xffffff, { emissive: 0x337788 }));
+   436→    g.add(inner);
+   437→    // a hint of what is being held, by item family
+   438→    const tint: Partial<Record<ItemId, number>> = {
+   439→      photon_dart: 0x35e0ff, triple_dart: 0x35e0ff, seeker_orb: 0xff5ad8,
+   440→      goo_trap: 0x8a4ae8, rear_mine: 0xff4422, turbo_cell: 0xffd84a,
+   441→      turbo_stack: 0xffd84a, star_core: 0xffe94a, orbit_shield: 0x35aaff,
+   442→      aegis_star: 0xfff0a0, storm_chip: 0xb08aff, track_hunter: 0xff7a2a,
+   443→      magnet_drone: 0xd8d84a,
+   444→    };
+   445→    (halo.material as THREE.MeshBasicMaterial).color.setHex(tint[id] ?? 0x9adfff);
+   446→    (inner.material as THREE.MeshLambertMaterial).color.setHex(tint[id] ?? 0xffffff);
+   447→    return g;
+   448→  }
+   449→
+   450→  private updateProjectiles(dt: number, t: number): void {
+   451→    for (const p of this.projectiles) {
+   452→      if (!p.active) continue;
+   453→      p.life -= dt;
+   454→      if (p.life <= 0) { this.killProjectile(p, false); continue; }
+   455→
+   456→      if (p.kind === 'dart') {
+   457→        p.pos.addScaledVector(p.vel, dt);
+   458→        this.stickToGround(p, 0.5);
+   459→      } else if (p.kind === 'seeker') {
+   460→        if (p.target && !p.target.battleKo) {
+   461→          const to = p.target.pos.clone().add(new THREE.Vector3(0, 0.9, 0)).sub(p.pos);
+   462→          const dist = to.length();
+   463→          to.normalize();
+   464→          const desired = to.multiplyScalar(p.speed);
+   465→          const turn = clamp(1 - Math.exp(-ITEMS.seekerTurnRate * dt), 0, 1);
+   466→          p.vel.lerp(desired, turn);
+   467→          p.vel.setLength(p.speed);
+   468→          if (dist < 1.6) { this.hitKart(p, p.target); continue; }
+   469→        }
+   470→        p.pos.addScaledVector(p.vel, dt);
+   471→        this.stickToGround(p, 0.7);
+   472→      } else if (p.kind === 'hunter') {
+   473→        const sp = this.world.spline;
+   474→        if (!sp) { this.killProjectile(p, false); continue; }
+   475→        p.s = ((p.s ?? 0) + (p.speed / sp.length) * dt) % 1;
+   476→        const sm = sp.sampleAt(p.s);
+   477→        p.pos.copy(sm.pos).add(new THREE.Vector3(0, 0.9, 0));
+   478→        p.mesh.rotation.y = -Math.atan2(sm.tangent.x, sm.tangent.z) + Math.PI;
+   479→        // proximity detonation vs any kart (not owner) it passes
+   480→        for (const k of this.karts) {
+   481→          if (k === p.owner || k.battleKo || k.finished) continue;
+   482→          if (!this.canHit(k, p.replica)) continue;
+   483→          if (k.pos.distanceTo(p.pos) < 2.2) { this.hitKart(p, k); break; }
+   484→        }
+   485→        if (!p.active) continue;
+   486→        // auto-expire when it laps back to owner progress
+   487→        if (p.target && p.target.finished) this.killProjectile(p, false);
+   488→      } else if (p.kind === 'magnet') {
+   489→        if (p.target && !p.target.battleKo) {
+   490→          const to = p.target.pos.clone().add(new THREE.Vector3(0, 1.4, 0)).sub(p.pos);
+   491→          const dist = to.length();
+   492→          to.normalize();
+   493→          p.pos.addScaledVector(to, p.speed * dt);
+   494→          p.mesh.rotation.y = t * 4;
+   495→          if (dist < 1.8) {
+   496→            // steal!
+   497→            if (p.target.itemSlot) {
+   498→              p.owner.itemSlot = p.target.itemSlot as ItemId;
+   499→              p.owner.itemCharges = p.target.itemCharges;
+   500→              p.target.itemSlot = null;
+   501→              p.target.itemCharges = 0;
+   502→              this.onEvent?.({ type: 'steal', kartId: p.owner.id, targetId: p.target.id, itemId: p.owner.itemSlot as ItemId, text: '¡Robo!' });
+   503→            }
+   504→            p.target.speed *= 0.85;
+   505→            this.killProjectile(p, true);
+   506→            continue;
+   507→          }
+   508→        } else {
+   509→          this.killProjectile(p, false);
+   510→          continue;
+   511→        }
+   512→      }
+   513→
+   514→      // generic kart collision for dart/seeker
+   515→      if (p.active && (p.kind === 'dart' || p.kind === 'seeker')) {
+   516→        for (const k of this.karts) {
+   517→          if (k === p.owner || k.battleKo || k.finished) continue;
+   518→          if (!this.canHit(k, p.replica)) continue;
+   519→          const dx = k.pos.x - p.pos.x, dz = k.pos.z - p.pos.z;
+   520→          const dy = k.pos.y + 0.8 - p.pos.y;
+   521→          if (dx * dx + dz * dz + dy * dy < 1.9 * 1.9) { this.hitKart(p, k); break; }
+   522→        }
+   523→      }
+   524→
+   525→      if (p.active) p.mesh.position.copy(p.pos);
+   526→    }
+   527→    this.projectiles = this.projectiles.filter(p => p.active);
+   528→  }
+   529→
+   530→  /** Keep projectiles hovering at track height. */
+   531→  private stickToGround(p: Projectile, hover: number): void {
+   532→    const g = this.world.groundQuery(p.pos, { mainIdx: -1, pathIdx: -1, ptIdx: -1 });
+   533→    if (g && g.hasGround) p.pos.y = Math.max(p.pos.y, g.height + hover);
+   534→    else { this.killProjectile(p, false); }
+   535→  }
+   536→
+   537→  private hitKart(p: Projectile, victim: KartController): void {
+   538→    // held-behind item blocks REAR shots without being consumed
+   539→    if (this.tryRearBlock(victim, p.pos)) {
+   540→      this.onEvent?.({ type: 'shield', kartId: victim.id, text: '¡Escudo trasero!' });
+   541→      this.killProjectile(p, true);
+   542→      return;
+   543→    }
+   544→    // orbit shield absorbs one hit
+   545→    if (victim.orbitShield > 0) {
+   546→      victim.orbitShield -= 1;
+   547→      this.onEvent?.({ type: 'shield', kartId: victim.id, text: '¡Bloqueado!' });
+   548→      this.killProjectile(p, true);
+   549→      return;
+   550→    }
+   551→    if (victim.invincible || victim.spinT > 0) {
+   552→      this.killProjectile(p, false);
+   553→      return;
+   554→    }
+   555→    if (p.kind === 'hunter') {
+   556→      victim.spinOut();
+   557→      victim.speed *= 0.15;
+   558→      // heavy hits launch the kart — a weighty, readable punishment
+   559→      victim.vy = Math.max(victim.vy, 4.2);
+   560→      victim.grounded = false;
+   561→    } else {
+   562→      victim.spinOut();
+   563→    }
+   564→    const fx = p.kind === 'dart' ? 'zap' : p.kind === 'seeker' ? 'seeker' : p.kind === 'hunter' ? 'blast' : 'zap';
+   565→    this.onEvent?.({ type: 'hit', kartId: victim.id, ownerId: p.owner.id, fx, text: '¡Impacto!' });
+   566→    this.killProjectile(p, true);
+   567→  }
+   568→
+   569→  private killProjectile(p: Projectile, pop: boolean): void {
+   570→    p.active = false;
+   571→    this.group.remove(p.mesh);
+   572→    if (pop) {
+   573→      // per-family burst color — reads as WHAT hit you, not just "a flash"
+   574→      const byKind: Record<string, number> = {
+   575→        dart: 0x35e0ff, seeker: 0xff5ad8, hunter: 0xff7a2a, magnet: 0xd8d84a,
+   576→      };
+   577→      const col = byKind[p.kind] ?? 0xffe94a;
+   578→      // small poof flash
+   579→      const flash = new THREE.Mesh(new THREE.SphereGeometry(0.8, 8, 6),
+   580→        new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.9 }));
+   581→      flash.position.copy(p.pos);
+   582→      this.group.add(flash);
+   583→      // expanding shockwave ring (flat, on the ground plane of the hit)
+   584→      const ring = new THREE.Mesh(new THREE.RingGeometry(0.5, 0.72, 20),
+   585→        new THREE.MeshBasicMaterial({ color: col, transparent: true, opacity: 0.75, side: THREE.DoubleSide }));
+   586→      ring.rotation.x = -Math.PI / 2;
+   587→      ring.position.copy(p.pos);
+   588→      ring.position.y += 0.15;
+   589→      this.group.add(ring);
+   590→      let life = 0.32;
+   591→      const shrink = (dt: number): boolean => {
+   592→        life -= dt;
+   593→        flash.scale.multiplyScalar(1 + dt * 6);
+   594→        (flash.material as THREE.MeshBasicMaterial).opacity = Math.max(0, life * 2.8);
+   595→        ring.scale.setScalar(1 + (0.32 - life) * 16);
+   596→        (ring.material as THREE.MeshBasicMaterial).opacity = Math.max(0, life * 2.4);
+   597→        if (life <= 0) {
+   598→          this.group.remove(flash); this.group.remove(ring);
+   599→          flash.geometry.dispose(); ring.geometry.dispose();
+   600→          return false;
+   601→        }
+   602→        return true;
+   603→      };
+   604→      this.animQueue.push({ update: shrink });
+   605→    }
+   606→  }
+   607→
+   608→  private animQueue: { update: (dt: number) => boolean }[] = [];
+   609→
+   610→  private updateTraps(dt: number, t: number): void {
+   611→    for (const tr of this.traps) {
+   612→      if (!tr.active) continue;
+   613→      tr.life -= dt;
+   614→      if (tr.life <= 0) { this.removeTrap(tr); continue; }
+   615→      if (tr.kind === 'mine') {
+   616→        // blink faster as it ages
+   617→        const blink = tr.mesh.children[1] as THREE.Mesh;
+   618→        (blink.material as THREE.MeshLambertMaterial).emissive.setHex(
+   619→          Math.sin(t * (2 + (1 - tr.life) * 4)) > 0 ? 0xff2200 : 0x330000);
+   620→      }
+   621→      for (const k of this.karts) {
+   622→        if (k.battleKo || k.finished) continue;
+   623→        if (k === tr.owner && tr.armed > 0) continue;
+   624→        if (k.invincible) continue;
+   625→        if (!this.canHit(k, tr.replica)) continue;
+   626→        const dx = k.pos.x - tr.pos.x, dz = k.pos.z - tr.pos.z;
+   627→        const r = tr.kind === 'goo' ? ITEMS.trapRadius : 2.1;
+   628→        if (dx * dx + dz * dz < r * r && Math.abs(k.pos.y - tr.pos.y) < 1.5) {
+   629→          if (this.tryRearBlock(k, tr.pos)) {
+   630→            this.onEvent?.({ type: 'shield', kartId: k.id, text: '¡Escudo trasero!' });
+   631→          } else if (k.orbitShield > 0) { k.orbitShield -= 1; this.onEvent?.({ type: 'shield', kartId: k.id, text: '¡Bloqueado!' }); }
+   632→          else {
+   633→            k.spinOut();
+   634→            k.speed *= tr.kind === 'mine' ? 0.1 : 0.3;
+   635→            if (tr.kind === 'mine') {
+   636→              // mines detonate: fiery blast + the kart gets tossed
+   637→              k.vy = Math.max(k.vy, 3.8);
+   638→              k.grounded = false;
+   639→            }
+   640→            this.onEvent?.({
+   641→              type: 'hit', kartId: k.id, ownerId: tr.owner.id,
+   642→              itemId: tr.kind === 'mine' ? 'rear_mine' : 'goo_trap',
+   643→              fx: tr.kind === 'mine' ? 'blast' : 'goo',
+   644→              text: tr.kind === 'mine' ? '¡Mina!' : '¡Cianobomba!'
+   645→            });
+   646→          }
+   647→          this.removeTrap(tr);
+   648→          break;
+   649→        }
+   650→      }
+   651→      tr.armed = Math.max(0, tr.armed - dt);
+   652→    }
+   653→    this.traps = this.traps.filter(tr => tr.active);
+   654→    // drain one-shot anims (update returns false when finished)
+   655→    this.animQueue = this.animQueue.filter(a => a.update(dt));
+   656→  }
+   657→
+   658→  private removeTrap(tr: TrapEntity): void {
+   659→    tr.active = false;
+   660→    this.group.remove(tr.mesh);
+   661→  }
+   662→
+   663→  private updateOrbiters(t: number): void {
+   664→    for (const k of this.karts) {
+   665→      let orbs = this.orbiters.get(k.id);
+   666→      if (k.orbitShield > 0 && (!orbs || orbs.length !== k.orbitShield)) {
+   667→        if (orbs) for (const o of orbs) this.group.remove(o);
+   668→        orbs = [];
+   669→        for (let i = 0; i < k.orbitShield; i++) {
+   670→          const o = new THREE.Mesh(new THREE.SphereGeometry(0.34, 8, 6),
+   671→            mat(0x35aaff, { emissive: 0x113366 }));
+   672→          this.group.add(o);
+   673→          orbs.push(o);
+   674→        }
+   675→        this.orbiters.set(k.id, orbs);
+   676→      } else if (k.orbitShield <= 0 && orbs) {
+   677→        for (const o of orbs) this.group.remove(o);
+   678→        this.orbiters.delete(k.id);
+   679→        orbs = undefined;
+   680→      }
+   681→      if (orbs) {
+   682→        for (let i = 0; i < orbs.length; i++) {
+   683→          const a = k.orbitAngle + (i / orbs.length) * Math.PI * 2;
+   684→          orbs[i].position.set(
+   685→            k.pos.x + Math.cos(a) * ITEMS.orbitRadius,
+   686→            k.pos.y + 1.0 + Math.sin(t * 3 + i) * 0.15,
+   687→            k.pos.z + Math.sin(a) * ITEMS.orbitRadius,
+   688→          );
+   689→        }
+   690→      }
+   691→    }
+   692→  }
+   693→
+   694→  /** External hook: strip a kart's shield orbs (battle KO etc.). */
+   695→  clearShield(kart: KartController): void {
+   696→    kart.orbitShield = 0;
+   697→    const orbs = this.orbiters.get(kart.id);
+   698→    if (orbs) { for (const o of orbs) this.group.remove(o); this.orbiters.delete(kart.id); }
+   699→  }
+   700→
+   701→  dispose(): void {
+   702→    this.group.traverse(o => { const m = o as THREE.Mesh; if (m.geometry) m.geometry.dispose(); });
+   703→    this.projectiles = [];
+   704→    this.traps = [];
+   705→    this.orbiters.clear();
+   706→    this.heldMeshes.clear();
+   707→  }
+   708→}
+   709→

@@ -949,29 +949,37 @@ export class TrackWorld {
   // ------------------------------------------------------------ item boxes
 
   private buildItemBoxes(): void {
-    const rng = makeRng(1337);
     const count = ITEMS.boxesPerTrack;
     for (let i = 0; i < count; i++) {
       // start the first row after the first corner (i+2), not on the grid
       const s = (((i + 2) % count) + 0.5) / count;
       const sm = this.spline.sampleAt(s);
-      const lateral = (rng() * 2 - 1) * Math.max(1, sm.halfWidth - 2.4);
-      const pos = this.spline.roadPoint(s, lateral).add(new THREE.Vector3(0, ITEMS.boxFloatHeight, 0));
-      const golden = i % 3 === 1;                 // MK8D-style double item boxes
-      const mesh = makeItemBoxMesh(golden);
-      mesh.position.copy(pos);
-      this.group.add(mesh);
-      this.itemBoxes.push({ pos, mesh, active: true, respawnAt: 0, golden });
-      this.animatables.push({
-        update: (t) => {
-          mesh.rotation.y = t * 1.4; mesh.rotation.x = t * 0.9;
-          mesh.position.y = pos.y + Math.sin(t * 2 + i) * 0.22;
-          if (!this.itemBoxes[i].active && performance.now() >= this.itemBoxes[i].respawnAt) {
-            this.itemBoxes[i].active = true;
-            mesh.visible = true;
-          }
-        },
-      });
+      const golden = i % 3 === 1;                 // MK8D-style double item rows
+      // MK-style: a lateral LINE of 3 boxes across the road (left/center/right)
+      const spread = Math.min(3.4, Math.max(1.8, sm.halfWidth - 1.7));
+      for (const lat of [-spread, 0, spread]) {
+        const pos = this.spline.roadPoint(s, lat).add(new THREE.Vector3(0, ITEMS.boxFloatHeight, 0));
+        const mesh = makeItemBoxMesh(golden);
+        mesh.position.copy(pos);
+        this.group.add(mesh);
+        const box: ItemBox = { pos, mesh, active: true, respawnAt: 0, golden };
+        this.itemBoxes.push(box);
+        const phase = i * 1.31 + lat * 0.7;
+        this.animatables.push({
+          update: (t) => {
+            mesh.rotation.y = t * 1.4; mesh.rotation.x = t * 0.85;
+            mesh.position.y = pos.y + Math.sin(t * 2 + phase) * 0.22;
+            if (!box.active && performance.now() >= box.respawnAt) {
+              box.active = true;
+              mesh.visible = true;
+              mesh.scale.setScalar(0.01);   // respawn pop-in
+            }
+            if (box.active && mesh.scale.x < 1) {
+              mesh.scale.setScalar(Math.min(1, mesh.scale.x * 1.14 + 0.015));
+            }
+          },
+        });
+      }
     }
   }
 
@@ -1966,24 +1974,36 @@ export class BattleWorld {
       }
     }
 
-    // item boxes scattered on a ring grid
+    // item boxes: short LINES of 3 scattered on the ring grid (MK-style rows)
     const rng = makeRng(555);
-    for (let i = 0; i < 14; i++) {
-      const a = (i / 14) * Math.PI * 2 + rng() * 0.3;
-      const r = radius * (0.35 + rng() * 0.5);
-      const pos = new THREE.Vector3(Math.cos(a) * r, ITEMS.boxFloatHeight, Math.sin(a) * r);
-      const mesh = makeItemBoxMesh();
-      mesh.position.copy(pos);
-      this.group.add(mesh);
-      const box: ItemBox = { pos, mesh, active: true, respawnAt: 0, golden: false };
-      this.itemBoxes.push(box);
-      this.animatables.push({
-        update: (t) => {
-          mesh.rotation.y = t * 1.4;
-          mesh.position.y = pos.y + Math.sin(t * 2 + i) * 0.25;
-          if (!box.active && performance.now() >= box.respawnAt) { box.active = true; mesh.visible = true; }
-        },
-      });
+    const clusters = 7;
+    for (let i = 0; i < clusters; i++) {
+      const a = (i / clusters) * Math.PI * 2 + rng() * 0.3;
+      const r = radius * (0.4 + rng() * 0.42);
+      const tx = -Math.sin(a), tz = Math.cos(a);   // tangent of the ring at a
+      for (const off of [-2.3, 0, 2.3]) {
+        const pos = new THREE.Vector3(Math.cos(a) * r + tx * off, ITEMS.boxFloatHeight, Math.sin(a) * r + tz * off);
+        const mesh = makeItemBoxMesh();
+        mesh.position.copy(pos);
+        this.group.add(mesh);
+        const box: ItemBox = { pos, mesh, active: true, respawnAt: 0, golden: false };
+        this.itemBoxes.push(box);
+        const phase = i + off;
+        this.animatables.push({
+          update: (t) => {
+            mesh.rotation.y = t * 1.4;
+            mesh.position.y = pos.y + Math.sin(t * 2 + phase) * 0.25;
+            if (!box.active && performance.now() >= box.respawnAt) {
+              box.active = true;
+              mesh.visible = true;
+              mesh.scale.setScalar(0.01);
+            }
+            if (box.active && mesh.scale.x < 1) {
+              mesh.scale.setScalar(Math.min(1, mesh.scale.x * 1.14 + 0.015));
+            }
+          },
+        });
+      }
     }
 
     // themed scatter + sky
@@ -2048,29 +2068,94 @@ export class BattleWorld {
 
 // ============================================================ small helpers
 
-/** Floating item box: translucent cube + glowing core. */
+/** ============================================================ item box visuals
+ * MK-style candy cube: glassy rainbow-striped shell + a big tumbling "?"
+ * inside + crisp white edges. Golden rows = double-item boxes (150cc+).
+ */
+let shellTexNormal: THREE.CanvasTexture | null = null;
+let shellTexGolden: THREE.CanvasTexture | null = null;
+let qMarkTex: THREE.CanvasTexture | null = null;
+
+function makeBoxShellTexture(golden: boolean): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d')!;
+  const cols = golden
+    ? ['#ffd23a', '#ffb02a', '#ffe08a', '#ffc23a', '#ffd968', '#ffb02a']
+    : ['#ff5a6e', '#ff9a3a', '#ffe94a', '#4ade68', '#38bdf8', '#b45aff'];
+  const w = (128 / cols.length) * 1.6;
+  ctx.save();
+  ctx.translate(64, 64);
+  ctx.rotate(-Math.PI / 4);
+  for (let i = -12; i <= 12; i++) {
+    ctx.fillStyle = cols[((i % cols.length) + cols.length) % cols.length];
+    ctx.fillRect(i * w - w / 2, -140, w, 280);
+  }
+  ctx.restore();
+  // glossy sheen so the cube reads as glass at speed
+  const grad = ctx.createLinearGradient(0, 0, 128, 128);
+  grad.addColorStop(0, 'rgba(255,255,255,0.36)');
+  grad.addColorStop(0.45, 'rgba(255,255,255,0.05)');
+  grad.addColorStop(1, 'rgba(255,255,255,0.22)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 128, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+function makeQMarkTexture(): THREE.CanvasTexture {
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d')!;
+  ctx.clearRect(0, 0, 128, 128);
+  ctx.font = '900 92px "Arial Black", Arial, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  ctx.strokeStyle = 'rgba(20,22,34,0.95)';
+  ctx.lineWidth = 16;
+  ctx.strokeText('?', 64, 70);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText('?', 64, 70);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 export function makeItemBoxMesh(golden = false): THREE.Group {
   const g = new THREE.Group();
-  const size = golden ? 1.32 : 1.15;
-  const shell = new THREE.Mesh(new THREE.BoxGeometry(size, size, size),
-    new THREE.MeshLambertMaterial(golden
-      ? { color: 0xffc23a, transparent: true, opacity: 0.62, emissive: 0x8a5a00 }
-      : { color: 0x4a9af2, transparent: true, opacity: 0.5, emissive: 0x10305a }));
-  const core = new THREE.Mesh(new THREE.OctahedronGeometry(golden ? 0.5 : 0.42, 0),
-    new THREE.MeshBasicMaterial({ color: golden ? 0xfff2b0 : 0xffffff }));
-  const frame = new THREE.Mesh(new THREE.BoxGeometry(size + 0.07, size + 0.07, size + 0.07),
-    new THREE.MeshBasicMaterial({ color: golden ? 0xffe08a : 0xbfe0ff, wireframe: true }));
-  g.add(shell, core, frame);
-  if (golden) {
-    // little sparkles so doubles read at speed
-    for (let i = 0; i < 4; i++) {
-      const sp = new THREE.Mesh(new THREE.OctahedronGeometry(0.09, 0),
-        new THREE.MeshBasicMaterial({ color: 0xffe94a }));
-      const a = (i / 4) * Math.PI * 2;
-      sp.position.set(Math.cos(a) * 0.95, Math.sin(a * 2) * 0.5, Math.sin(a) * 0.95);
-      g.add(sp);
-    }
+  if (!shellTexNormal) shellTexNormal = makeBoxShellTexture(false);
+  if (!shellTexGolden) shellTexGolden = makeBoxShellTexture(true);
+  if (!qMarkTex) qMarkTex = makeQMarkTexture();
+  const size = golden ? 1.4 : 1.26;
+  // glassy candy shell
+  const shell = new THREE.Mesh(
+    new THREE.BoxGeometry(size, size, size),
+    new THREE.MeshPhongMaterial({
+      map: golden ? shellTexGolden : shellTexNormal,
+      transparent: true,
+      opacity: 0.72,
+      shininess: 120,
+      specular: 0xffffff,
+      emissive: golden ? 0x5a3c00 : 0x181828,
+    }),
+  );
+  g.add(shell);
+  // big tumbling "?" — two crossed billboards inside the cube
+  const qMat = new THREE.MeshBasicMaterial({ map: qMarkTex, transparent: true, side: THREE.DoubleSide });
+  for (const rot of [0, Math.PI / 2]) {
+    const q = new THREE.Mesh(new THREE.PlaneGeometry(size * 0.66, size * 0.66), qMat);
+    q.rotation.y = rot;
+    g.add(q);
   }
+  // crisp cartoon outline — the instant "item box" read at 100 km/h
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(size * 1.002, size * 1.002, size * 1.002)),
+    new THREE.LineBasicMaterial({ color: golden ? 0xfff0c0 : 0xffffff, transparent: true, opacity: 0.9 }),
+  );
+  g.add(edges);
   return g;
 }
 

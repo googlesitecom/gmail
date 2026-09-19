@@ -39,11 +39,62 @@ export interface VisualState {
   airborne: boolean;
   trickSpin: number;       // 0..1 stunt progress (0 = none)
   trickKind: number;       // 0 front-flip, 1 roll left, 2 roll right
+  /** glider/parachute deployment 0..1 (0 = closed) */
+  glider: number;
+  /** 0..1 decaying drift-engagement kick (suspension pop, no hop) */
+  driftKick: number;
 }
 
 const TIRE = 0x181a20;
 const DARK = 0x1c1e26;
 const ACCENT = 0xf2f4f8;
+
+/**
+ * Toon shading: one shared 3-step gradient map gives characters the clean
+ * cel-shaded party-racer look (flat plastic Lambert read as "asset flip").
+ */
+let toonGradient: THREE.DataTexture | null = null;
+function getToonGradient(): THREE.DataTexture {
+  if (toonGradient) return toonGradient;
+  const data = new Uint8Array([90, 160, 215, 255]);
+  const tex = new THREE.DataTexture(data, 4, 1, THREE.RedFormat);
+  tex.needsUpdate = true;
+  tex.minFilter = tex.magFilter = THREE.NearestFilter;
+  toonGradient = tex;
+  return tex;
+}
+
+/** Toon material factory for character parts. */
+function toonMat(color: number, opts: { emissive?: number; side?: THREE.Side } = {}): THREE.MeshToonMaterial {
+  return new THREE.MeshToonMaterial({
+    color,
+    gradientMap: getToonGradient(),
+    ...(opts.emissive !== undefined ? { emissive: opts.emissive } : {}),
+    ...(opts.side !== undefined ? { side: opts.side } : {}),
+  });
+}
+
+/** Parachute canopy texture: bold racer-color / white sectors (radial stripes). */
+const canopyTexCache = new Map<number, THREE.CanvasTexture>();
+function makeCanopyTexture(color: number): THREE.CanvasTexture {
+  const hit = canopyTexCache.get(color);
+  if (hit) return hit;
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  const ctx = c.getContext('2d')!;
+  const col = '#' + color.toString(16).padStart(6, '0');
+  for (let i = 0; i < 8; i++) {
+    ctx.fillStyle = i % 2 ? '#f4f6fa' : col;
+    ctx.fillRect(i * 32, 0, 32, 128);
+  }
+  // subtle center panel
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.fillRect(112, 0, 32, 128);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  canopyTexCache.set(color, tex);
+  return tex;
+}
 
 /** Racing numbers per racer (chest badge + identity). */
 const RACE_NUMBERS: Record<string, number> = {
@@ -113,6 +164,9 @@ const T = (
   return g;
 };
 
+/** anything that carries color+emissive and can flash / be tinted */
+type TintMat = THREE.MeshLambertMaterial | THREE.MeshToonMaterial | THREE.MeshStandardMaterial;
+
 export class KartVisual {
   readonly group = new THREE.Group();
   private body = new THREE.Group();
@@ -138,8 +192,12 @@ export class KartVisual {
   private exhausts: THREE.Mesh[] = [];
   private boostFlames: THREE.Mesh[] = [];
   private trailMeshes: THREE.Mesh[] = [];
-  private materials: THREE.MeshLambertMaterial[] = [];
-  private chassisMats: THREE.MeshLambertMaterial[] = [];
+  /** materials whose emissive flashes on hit/star (Lambert, Toon or GLB Standard) */
+  private materials: TintMat[] = [];
+  private chassisMats: TintMat[] = [];
+  /** glider/parachute rig (built once, hidden until a long fall) */
+  private glider = new THREE.Group();
+  private gliderArms: THREE.Group[] = [];
   private anim: KartAnim = 'idle';
   private animT = 0;
   private bounce = 0;        // suspension visual spring
@@ -160,6 +218,7 @@ export class KartVisual {
     } else {
       this.buildCharacter(characterId);
     }
+    this.buildGlider(kartColor);
     this.group.add(this.body);
     if (!driverOwnsKart) this.body.add(this.characterRoot);
   }
@@ -421,12 +480,20 @@ export class KartVisual {
 
   // ------------------------------------------------------------ character
 
+  /**
+   * Procedural chibi racer v2 — cel-shaded (toon materials), meatier torso,
+   * visible legs + boots, harness straps, chunky gloved hands gripping the
+   * wheel and a per-species head with NO generic helmet (the old one sat on
+   * every head like a floating bowl and hid the faces).
+   */
   private buildCharacter(id: string): void {
     const c = CHARACTER_MAP[id];
-    const skinMat = new THREE.MeshLambertMaterial({ color: c.accent });
-    const outfitMat = new THREE.MeshLambertMaterial({ color: c.color });
-    const suitMat = new THREE.MeshLambertMaterial({ color: 0x2a2c36 });
-    this.materials.push(skinMat, outfitMat, suitMat);
+    const skinMat = toonMat(c.accent);
+    const outfitMat = toonMat(c.color);
+    const suitMat = toonMat(0x32343f);
+    const gloveMat = toonMat(0xf0f2f7);
+    const bootMat = toonMat(0x272933);
+    this.materials.push(skinMat, outfitMat, suitMat, gloveMat, bootMat);
 
     // seat placement: GLB karts carry a cockpit anchor + scale in the manifest
     const seat = this.seatAnchor();
@@ -434,111 +501,140 @@ export class KartVisual {
     this.characterRoot.scale.setScalar(this.seatScale);
     this.seatY = seat.y;
 
-    this.torso.position.y = 0.55;
-    const chest = new THREE.Mesh(new THREE.CapsuleGeometry(0.3, 0.32, 4, 8), outfitMat);
-    chest.position.y = 0.25;
+    // ---- torso: seated racing posture (slight recline, weight in the seat)
+    this.torso.position.y = 0.42;
+    const chest = new THREE.Mesh(new THREE.CapsuleGeometry(0.34, 0.3, 5, 10), outfitMat);
+    chest.position.y = 0.3;
+    chest.scale.set(1.06, 1, 0.92);
     chest.castShadow = true;
     this.torso.add(chest);
-    // shoulders for a chunkier racing silhouette
+    // belly — a soft sphere breaks the capsule monotony (chibi read)
+    const belly = new THREE.Mesh(new THREE.SphereGeometry(0.26, 10, 8), suitMat);
+    belly.scale.set(1.05, 0.82, 0.78);
+    belly.position.set(0, 0.08, 0.13);
+    this.torso.add(belly);
+    // chunky shoulders
     for (const s of [-1, 1]) {
-      const shoulder = new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 6), outfitMat);
-      shoulder.position.set(s * 0.3, 0.5, 0.05);
+      const shoulder = new THREE.Mesh(new THREE.SphereGeometry(0.155, 9, 7), outfitMat);
+      shoulder.position.set(s * 0.33, 0.52, 0.02);
       this.torso.add(shoulder);
     }
+    // harness: two straps crossing the chest in the accent color
+    for (const s of [-1, 1]) {
+      const strap = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.52, 0.05), suitMat);
+      strap.position.set(s * 0.15, 0.32, 0.275);
+      strap.rotation.z = s * 0.55;
+      strap.rotation.x = -0.1;
+      this.torso.add(strap);
+    }
     // racing collar (neck brace) — the #1 "that's a racer" tell
-    const collar = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.075, 8, 14), suitMat);
-    collar.rotation.x = Math.PI / 2 - 0.25;
-    collar.position.set(0, 0.6, 0.02);
+    const collar = new THREE.Mesh(new THREE.TorusGeometry(0.185, 0.08, 8, 14), suitMat);
+    collar.rotation.x = Math.PI / 2 - 0.3;
+    collar.position.set(0, 0.62, 0.0);
     this.torso.add(collar);
     // chest number panel — race-grade livery
-    const badge = new THREE.Mesh(new THREE.CircleGeometry(0.14, 18),
+    const badge = new THREE.Mesh(new THREE.CircleGeometry(0.15, 18),
       new THREE.MeshBasicMaterial({ map: getNumberTexture(id), transparent: true }));
-    badge.position.set(0, 0.32, 0.285);
+    badge.position.set(0, 0.3, 0.31);
     badge.rotation.x = -0.18;
     this.torso.add(badge);
     this.characterRoot.add(this.torso);
 
-    // arms reach the wheel: suit sleeve + elbow pad + chunky racing gloves
-    const gloveMat = new THREE.MeshLambertMaterial({ color: 0xe8eaef });
-    this.materials.push(gloveMat);
+    // ---- legs: go-kart drivers stretch to the pedals — thighs + boots read
+    // instantly from the side/rear chase camera and fix the "floating bust"
+    for (const s of [-1, 1]) {
+      const thigh = new THREE.Mesh(new THREE.CapsuleGeometry(0.135, 0.3, 4, 8), outfitMat);
+      thigh.position.set(s * 0.185, -0.02, 0.36);
+      thigh.rotation.x = 1.25;
+      thigh.scale.set(1, 1, 0.9);
+      this.torso.add(thigh);
+      const boot = new THREE.Mesh(new THREE.SphereGeometry(0.14, 8, 7), bootMat);
+      boot.scale.set(0.85, 0.7, 1.5);
+      boot.position.set(s * 0.19, -0.22, 0.56);
+      this.torso.add(boot);
+    }
+
+    // ---- arms: two-segment reach to the wheel with mitten gloves
     for (const [arm, s] of [[this.armL, -1], [this.armR, 1]] as [THREE.Group, number][]) {
-      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(0.09, 0.42, 3, 6), outfitMat);
-      upper.position.set(0, -0.1, 0.22);
-      upper.rotation.x = 1.15; upper.rotation.z = s * 0.18;
+      const upper = new THREE.Mesh(new THREE.CapsuleGeometry(0.105, 0.3, 4, 8), outfitMat);
+      upper.position.set(0, -0.06, 0.14);
+      upper.rotation.x = 1.0; upper.rotation.z = s * 0.22;
       arm.add(upper);
-      const pad = new THREE.Mesh(new THREE.SphereGeometry(0.085, 6, 5), suitMat);
-      pad.scale.set(1, 1, 1.2);
-      pad.position.set(0, -0.2, 0.32);
-      arm.add(pad);
-      const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.085, 0.09, 8), suitMat);
-      cuff.position.set(0, -0.25, 0.39);
-      cuff.rotation.x = 1.15;
+      const elbow = new THREE.Mesh(new THREE.SphereGeometry(0.095, 8, 6), outfitMat);
+      elbow.position.set(0, -0.18, 0.27);
+      arm.add(elbow);
+      const fore = new THREE.Mesh(new THREE.CapsuleGeometry(0.09, 0.24, 4, 8), outfitMat);
+      fore.position.set(0, -0.24, 0.38);
+      fore.rotation.x = 1.35;
+      arm.add(fore);
+      const cuff = new THREE.Mesh(new THREE.CylinderGeometry(0.088, 0.096, 0.1, 10), suitMat);
+      cuff.position.set(0, -0.3, 0.45);
+      cuff.rotation.x = 1.35;
       arm.add(cuff);
-      const glove = new THREE.Mesh(new THREE.SphereGeometry(0.09, 6, 5), gloveMat);
-      glove.position.set(0, -0.29, 0.44);
+      const glove = new THREE.Mesh(new THREE.SphereGeometry(0.115, 9, 7), gloveMat);
+      glove.scale.set(1, 0.92, 1.12);
+      glove.position.set(0, -0.34, 0.52);
       arm.add(glove);
-      const thumb = new THREE.Mesh(new THREE.SphereGeometry(0.032, 5, 4), gloveMat);
-      thumb.position.set(s * 0.05, -0.26, 0.47);
+      const thumb = new THREE.Mesh(new THREE.SphereGeometry(0.042, 6, 5), gloveMat);
+      thumb.position.set(s * 0.06, -0.3, 0.56);
       arm.add(thumb);
-      arm.position.set(s * 0.3, 0.42, 0.1);
+      arm.position.set(s * 0.31, 0.5, 0.08);
+      arm.rotation.x = -0.12;
       this.torso.add(arm);
     }
 
     this.buildSpeciesHead(id, skinMat, outfitMat);
-    this.head.position.y = 0.78;
-    this.head.scale.setScalar(1.22);   // party-racer proportions: big head
+    this.head.position.y = 0.86;
+    this.head.scale.setScalar(1.12);   // still chibi, no longer a lollipop
     this.torso.add(this.head);
-    // racing helmet over the species head (crest + tinted raised visor)
-    this.buildHelmet(id, c.color);
   }
 
-  /**
-   * Racing helmet: color-matched shell with a white stripe, a raised tinted
-   * visor (faces stay fully visible) and a rear fin. Species ears/horns poke
-   * through the shell on purpose — cartoon headgear reads instantly.
-   */
-  private buildHelmet(id: string, color: number): void {
-    const H = this.head;
-    const shellMat = new THREE.MeshLambertMaterial({ color });
-    const whiteMat = new THREE.MeshLambertMaterial({ color: 0xf2f4f8 });
-    const visorMat = new THREE.MeshLambertMaterial({
-      color: 0x141a26, emissive: 0x0a1424, transparent: true, opacity: 0.92,
-    });
-    this.materials.push(shellMat, whiteMat, visorMat);
+  // ------------------------------------------------------------ glider
 
-    // dome shell covering the top of the head
-    const shell = new THREE.Mesh(
-      new THREE.SphereGeometry(0.345, 14, 10, 0, Math.PI * 2, 0, Math.PI * 0.55), shellMat);
-    shell.position.set(0, 0.045, -0.03);
-    H.add(shell);
-    // white center stripe (front-to-back meridian band)
-    const stripe = new THREE.Mesh(
-      new THREE.SphereGeometry(0.35, 14, 8, Math.PI / 2 - 0.16, 0.32, 0, Math.PI * 0.5), whiteMat);
-    stripe.position.copy(shell.position);
-    H.add(stripe);
-    // raised tinted visor slab above the brow (open-face look)
-    const visor = new THREE.Mesh(new THREE.SphereGeometry(0.35, 14, 6, Math.PI / 2 - 1.05, 2.1, Math.PI * 0.24, Math.PI * 0.16),
-      visorMat);
-    visor.position.copy(shell.position);
-    H.add(visor);
-    // small brim lip under the visor
-    const brim = new THREE.Mesh(new THREE.TorusGeometry(0.33, 0.028, 6, 16, Math.PI * 0.9), whiteMat);
-    brim.position.set(0, 0.12, 0.13);
-    brim.rotation.x = Math.PI / 2 - 0.35;
-    brim.rotation.z = Math.PI * 0.55;
-    H.add(brim);
-    // rear aero fin
-    const fin = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.24, 4), whiteMat);
-    fin.position.set(0, 0.16, -0.34);
-    fin.rotation.x = -Math.PI / 2 - 0.5;
-    H.add(fin);
-    // chin strap hint
-    const strap = new THREE.Mesh(new THREE.TorusGeometry(0.3, 0.02, 5, 14, Math.PI),
-      new THREE.MeshLambertMaterial({ color: 0x22242c }));
-    strap.position.set(0, -0.12, 0);
-    strap.rotation.y = Math.PI / 2;
-    strap.rotation.z = Math.PI;
-    H.add(strap);
+  /**
+   * Parachute/glider rig: striped canopy + suspension lines, hidden until a
+   * long fall pops it open (MK7/8 glide sections). Sits on `group` (not the
+   * trick-tumbling body) so the canopy stays level above the kart.
+   */
+  private buildGlider(kartColor: number): void {
+    const G = this.glider;
+    const canopyTex = makeCanopyTexture(kartColor);
+    const canopy = new THREE.Mesh(
+      new THREE.SphereGeometry(1.5, 20, 10, 0, Math.PI * 2, 0, Math.PI * 0.46),
+      new THREE.MeshLambertMaterial({ map: canopyTex, side: THREE.DoubleSide }),
+    );
+    canopy.scale.set(1, 0.58, 1);
+    G.add(canopy);
+    // bright rim so the canopy reads against the sky
+    const rim = new THREE.Mesh(new THREE.TorusGeometry(1.44, 0.05, 6, 24),
+      toonMat(0xf2f4f8));
+    rim.rotation.x = Math.PI / 2;
+    G.add(rim);
+    // hub + suspension lines down to the kart
+    const lineMat = new THREE.MeshBasicMaterial({ color: 0xd8dce6 });
+    const hub = new THREE.Mesh(new THREE.SphereGeometry(0.06, 6, 5), lineMat);
+    hub.position.y = -1.05;
+    G.add(hub);
+    const lineGeo: THREE.BufferGeometry[] = [];
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2;
+      const x = Math.cos(a) * 1.38, z = Math.sin(a) * 1.38;
+      const dx = x, dy = -1.0, dz = z;
+      const len = Math.hypot(dx, dy, dz);
+      const cyl = new THREE.CylinderGeometry(0.014, 0.014, len, 4);
+      // orient: from rim point down to hub
+      const mid = new THREE.Vector3(x / 2, -0.5, z / 2);
+      const dir = new THREE.Vector3(dx, dy, dz).normalize();
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      cyl.applyQuaternion(q);
+      cyl.translate(mid.x, mid.y, mid.z);
+      lineGeo.push(cyl);
+    }
+    const lines = new THREE.Mesh(mergeGeometries(lineGeo) ?? new THREE.BoxGeometry(0.01, 0.01, 0.01), lineMat);
+    G.add(lines);
+    G.position.set(0, 2.5, 0.1);
+    G.visible = false;
+    this.group.add(G);
   }
 
   // ------------------------------------------------------------ face helpers
@@ -548,7 +644,7 @@ export class KartVisual {
     H: THREE.Group, s: number,
     o: { x?: number; y?: number; z?: number; r?: number; iris?: number; sclera?: number } = {},
   ): void {
-    const { x = 0.12, y = 0.07, z = 0.26, r = 0.09, iris = 0x1a1a22, sclera = 0xffffff } = o;
+    const { x = 0.12, y = 0.07, z = 0.27, r = 0.105, iris = 0x1a1a22, sclera = 0xffffff } = o;
     const g = new THREE.Group();
     const white = new THREE.Mesh(new THREE.SphereGeometry(r, 10, 8), new THREE.MeshBasicMaterial({ color: sclera }));
     white.scale.set(1, 1.16, 0.62);
@@ -595,39 +691,39 @@ export class KartVisual {
     }
   }
 
-  private buildSpeciesHead(id: string, skin: THREE.MeshLambertMaterial, outfit: THREE.MeshLambertMaterial): void {
+  private buildSpeciesHead(id: string, skin: THREE.MeshToonMaterial, outfit: THREE.MeshToonMaterial): void {
     const H = this.head;
 
     switch (id) {
       case 'pip': { // raccoon: grey head, bandit mask, ears, striped tail
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.3, 10, 8), new THREE.MeshLambertMaterial({ color: 0x9a9aa6 }));
-        this.materials.push(headM.material as THREE.MeshLambertMaterial);
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.3, 10, 8), toonMat(0x9a9aa6));
+        this.materials.push(headM.material as THREE.MeshToonMaterial);
         H.add(headM);
-        const mask = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.14, 0.2), new THREE.MeshLambertMaterial({ color: 0x2c2c34 }));
+        const mask = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.14, 0.2), toonMat(0x2c2c34));
         mask.position.set(0, 0.06, 0.24); H.add(mask);
         for (const s of [-1, 1]) {
-          const ear = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.24, 5), new THREE.MeshLambertMaterial({ color: 0x8a8a96 }));
+          const ear = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.24, 5), toonMat(0x8a8a96));
           ear.position.set(s * 0.17, 0.3, 0); H.add(ear);
-          const inner = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.14, 5), new THREE.MeshLambertMaterial({ color: 0x54545e }));
+          const inner = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.14, 5), toonMat(0x54545e));
           inner.position.set(s * 0.17, 0.29, 0.03); H.add(inner);
         }
         this.addEye2(H, -1, { y: 0.06, z: 0.3 }); this.addEye2(H, 1, { y: 0.06, z: 0.3 });
         this.addSmile(H, -0.12, 0.27, 0.12);
         // striped tail poking out the back
         const tail = new THREE.Mesh(new THREE.CapsuleGeometry(0.09, 0.55, 4, 6),
-          new THREE.MeshLambertMaterial({ color: 0xb59a6a }));
+          toonMat(0xb59a6a));
         tail.position.set(0, 0.9, -1.15); tail.rotation.x = 0.9;
         this.body.add(tail);
-        const tailTip = new THREE.Mesh(new THREE.SphereGeometry(0.11, 6, 5), new THREE.MeshLambertMaterial({ color: 0x3a3a44 }));
+        const tailTip = new THREE.Mesh(new THREE.SphereGeometry(0.11, 6, 5), toonMat(0x3a3a44));
         tailTip.position.set(0, 1.12, -1.32);
         this.body.add(tailTip);
         break;
       }
       case 'zippy': { // electric imp: purple, cyan horns, glowing eyes
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 10), new THREE.MeshLambertMaterial({ color: 0x7a4ac8 }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 10), toonMat(0x7a4ac8));
         H.add(headM);
         for (const s of [-1, 1]) {
-          const horn = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.3, 6), new THREE.MeshLambertMaterial({ color: 0x35e0d8, emissive: 0x0c4a48 }));
+          const horn = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.3, 6), toonMat(0x35e0d8, { emissive: 0x0c4a48 }));
           horn.position.set(s * 0.15, 0.31, 0); horn.rotation.z = s * 0.35; H.add(horn);
         }
         // lightning bolt crest
@@ -652,10 +748,10 @@ export class KartVisual {
         break;
       }
       case 'mimi': { // flower sprite: green head + petal crown
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 10), new THREE.MeshLambertMaterial({ color: 0x8ad86a }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 10), toonMat(0x8ad86a));
         H.add(headM);
         for (let i = 0; i < 7; i++) {
-          const petal = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.28, 6), new THREE.MeshLambertMaterial({ color: i % 2 ? 0xff8ac8 : 0xffb0d8 }));
+          const petal = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.28, 6), toonMat(i % 2 ? 0xff8ac8 : 0xffb0d8));
           const a = (i / 7) * Math.PI * 2;
           petal.position.set(Math.cos(a) * 0.23, 0.2 + Math.sin(a) * 0.1, Math.sin(a) * 0.14);
           petal.rotation.z = -Math.cos(a) * 1.2; petal.rotation.x = Math.sin(a) * 0.8;
@@ -671,7 +767,7 @@ export class KartVisual {
         const headM = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 10), skin);
         H.add(headM);
         const hair = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.55),
-          new THREE.MeshLambertMaterial({ color: 0x3a2a1e }));
+          toonMat(0x3a2a1e));
         hair.position.y = 0.02; H.add(hair);
         const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.3, 0.15, 12), outfit);
         cap.position.y = 0.24; H.add(cap);
@@ -683,13 +779,13 @@ export class KartVisual {
         break;
       }
       case 'bolt': { // golden retriever: floppy ears, muzzle, tongue out
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.29, 12, 10), new THREE.MeshLambertMaterial({ color: 0xc8905a }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.29, 12, 10), toonMat(0xc8905a));
         H.add(headM);
         for (const s of [-1, 1]) {
-          const ear = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.26, 4, 8), new THREE.MeshLambertMaterial({ color: 0xa87848 }));
+          const ear = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.26, 4, 8), toonMat(0xa87848));
           ear.position.set(s * 0.27, 0.0, 0.02); ear.rotation.z = s * 0.5; H.add(ear);
         }
-        const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.15, 10, 8), new THREE.MeshLambertMaterial({ color: 0xe8c8a0 }));
+        const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.15, 10, 8), toonMat(0xe8c8a0));
         muzzle.scale.set(1.15, 0.85, 1);
         muzzle.position.set(0, -0.05, 0.26); H.add(muzzle);
         const nose = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 6), new THREE.MeshBasicMaterial({ color: 0x201820 }));
@@ -702,14 +798,14 @@ export class KartVisual {
         break;
       }
       case 'rex': { // dragon hatchling: snout, horns, tiny wings
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.29, 12, 10), new THREE.MeshLambertMaterial({ color: 0x5ad85a }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.29, 12, 10), toonMat(0x5ad85a));
         H.add(headM);
-        const snout = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.15, 0.24), new THREE.MeshLambertMaterial({ color: 0x7ae87a }));
+        const snout = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.15, 0.24), toonMat(0x7ae87a));
         snout.position.set(0, -0.03, 0.26); H.add(snout);
         for (const s of [-1, 1]) {
           const nostril = new THREE.Mesh(new THREE.SphereGeometry(0.025, 6, 5), new THREE.MeshBasicMaterial({ color: 0x1a3a1a }));
           nostril.position.set(s * 0.07, 0.01, 0.38); H.add(nostril);
-          const horn = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.22, 5), new THREE.MeshLambertMaterial({ color: 0xf2d04a }));
+          const horn = new THREE.Mesh(new THREE.ConeGeometry(0.05, 0.22, 5), toonMat(0xf2d04a));
           horn.position.set(s * 0.12, 0.27, -0.05); horn.rotation.z = s * 0.4; H.add(horn);
         }
         this.addEye2(H, -1, { y: 0.1, z: 0.25, iris: 0xaa5a10, r: 0.095 });
@@ -723,7 +819,7 @@ export class KartVisual {
         fang.position.set(0.06, -0.08, 0.37); fang.rotation.x = Math.PI; H.add(fang);
         // little wings on the seat back
         for (const s of [-1, 1]) {
-          const wing = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.5, 4), new THREE.MeshLambertMaterial({ color: 0x48b848 }));
+          const wing = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.5, 4), toonMat(0x48b848));
           wing.position.set(s * 0.35, 1.25, -0.75); wing.rotation.z = s * -1.9;
           this.body.add(wing);
         }
@@ -733,16 +829,16 @@ export class KartVisual {
         const headM = new THREE.Mesh(new THREE.SphereGeometry(0.28, 12, 10), skin);
         H.add(headM);
         const hair = new THREE.Mesh(new THREE.SphereGeometry(0.3, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.6),
-          new THREE.MeshLambertMaterial({ color: 0xff6ab8 }));
+          toonMat(0xff6ab8));
         hair.position.y = 0.03; H.add(hair);
-        const ponytail = new THREE.Mesh(new THREE.CapsuleGeometry(0.09, 0.3, 4, 8), new THREE.MeshLambertMaterial({ color: 0xff6ab8 }));
+        const ponytail = new THREE.Mesh(new THREE.CapsuleGeometry(0.09, 0.3, 4, 8), toonMat(0xff6ab8));
         ponytail.position.set(-0.26, 0.05, -0.16); ponytail.rotation.z = 0.7; H.add(ponytail);
         // headset band + earcup + mic boom
-        const band = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.035, 6, 12, Math.PI), new THREE.MeshLambertMaterial({ color: 0x222228 }));
+        const band = new THREE.Mesh(new THREE.TorusGeometry(0.28, 0.035, 6, 12, Math.PI), toonMat(0x222228));
         band.rotation.z = 0; band.position.y = 0.08; band.rotation.y = Math.PI / 2; H.add(band);
-        const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.06, 8), new THREE.MeshLambertMaterial({ color: 0xff6ab8, emissive: 0x501030 }));
+        const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.075, 0.06, 8), toonMat(0xff6ab8, { emissive: 0x501030 }));
         cup.rotation.z = Math.PI / 2; cup.position.set(0.26, 0.06, 0); H.add(cup);
-        const mic = new THREE.Mesh(new THREE.CapsuleGeometry(0.016, 0.16, 4, 6), new THREE.MeshLambertMaterial({ color: 0x222228 }));
+        const mic = new THREE.Mesh(new THREE.CapsuleGeometry(0.016, 0.16, 4, 6), toonMat(0x222228));
         mic.position.set(0.19, -0.12, 0.2); mic.rotation.z = 0.9; H.add(mic);
         const star = new THREE.Mesh(new THREE.OctahedronGeometry(0.08, 0), new THREE.MeshBasicMaterial({ color: 0xffe94a }));
         star.position.set(0.16, 0.27, 0.14); H.add(star);
@@ -755,28 +851,28 @@ export class KartVisual {
       case 'gus': { // dwarf: braided beard + golden helm
         const headM = new THREE.Mesh(new THREE.SphereGeometry(0.29, 12, 10), skin);
         H.add(headM);
-        const beard = new THREE.Mesh(new THREE.SphereGeometry(0.19, 10, 8), new THREE.MeshLambertMaterial({ color: 0xc8603a }));
+        const beard = new THREE.Mesh(new THREE.SphereGeometry(0.19, 10, 8), toonMat(0xc8603a));
         beard.scale.set(1.2, 1.35, 0.75);
         beard.position.set(0, -0.2, 0.14); H.add(beard);
         const helm = new THREE.Mesh(new THREE.SphereGeometry(0.31, 12, 10, 0, Math.PI * 2, 0, Math.PI * 0.52),
-          new THREE.MeshLambertMaterial({ color: 0xd8b23a }));
+          toonMat(0xd8b23a));
         helm.position.y = 0.05; H.add(helm);
-        const rivet = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.05, 0.06), new THREE.MeshLambertMaterial({ color: 0x8a6a1a }));
+        const rivet = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.05, 0.06), toonMat(0x8a6a1a));
         rivet.position.set(0, 0.13, 0.28); H.add(rivet);
         this.addEye2(H, -1, { y: 0.05, z: 0.27 }); this.addEye2(H, 1, { y: 0.05, z: 0.27 });
         this.addBrows(H, 0x8a3a1a, 0.16, 0.26, 0.35, 0.15);
         break;
       }
       case 'tiki': { // volcano golem: rock cube head, lava cracks, ember top
-        const headM = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.44, 0.42), new THREE.MeshLambertMaterial({ color: 0x3a2e28 }));
+        const headM = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.44, 0.42), toonMat(0x3a2e28));
         H.add(headM);
         // deep-set glowing eyes (rect visor slits)
         for (const s of [-1, 1]) {
-          const socket = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 0.06), new THREE.MeshLambertMaterial({ color: 0x1a120e }));
+          const socket = new THREE.Mesh(new THREE.BoxGeometry(0.15, 0.12, 0.06), toonMat(0x1a120e));
           socket.position.set(s * 0.11, 0.08, 0.2); H.add(socket);
           const eye = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.07, 0.05), new THREE.MeshBasicMaterial({ color: 0xffb63a }));
           eye.position.set(s * 0.11, 0.08, 0.23); H.add(eye);
-          const brow = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.06, 0.06), new THREE.MeshLambertMaterial({ color: 0x241a14 }));
+          const brow = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.06, 0.06), toonMat(0x241a14));
           brow.position.set(s * 0.11, 0.18, 0.21); brow.rotation.z = -s * 0.35; H.add(brow);
         }
         // lava crack mouth
@@ -790,34 +886,34 @@ export class KartVisual {
         break;
       }
       case 'bruiser': { // boxing bear: round head, little ears, muzzle, headband
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.31, 12, 10), new THREE.MeshLambertMaterial({ color: 0x9a6a3a }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.31, 12, 10), toonMat(0x9a6a3a));
         H.add(headM);
         for (const s of [-1, 1]) {
-          const ear = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 6), new THREE.MeshLambertMaterial({ color: 0x8a5a30 }));
+          const ear = new THREE.Mesh(new THREE.SphereGeometry(0.1, 8, 6), toonMat(0x8a5a30));
           ear.position.set(s * 0.22, 0.26, 0); H.add(ear);
-          const inner = new THREE.Mesh(new THREE.SphereGeometry(0.055, 6, 5), new THREE.MeshLambertMaterial({ color: 0xd8b088 }));
+          const inner = new THREE.Mesh(new THREE.SphereGeometry(0.055, 6, 5), toonMat(0xd8b088));
           inner.position.set(s * 0.22, 0.26, 0.05); H.add(inner);
         }
-        const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), new THREE.MeshLambertMaterial({ color: 0xd8b088 }));
+        const muzzle = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), toonMat(0xd8b088));
         muzzle.scale.set(1.2, 0.85, 1);
         muzzle.position.set(0, -0.06, 0.24); H.add(muzzle);
         const nose = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 6), new THREE.MeshBasicMaterial({ color: 0x1c1418 }));
         nose.scale.set(1.3, 0.9, 0.8);
         nose.position.set(0, -0.01, 0.37); H.add(nose);
         // red boxing headband with a knot
-        const band = new THREE.Mesh(new THREE.TorusGeometry(0.29, 0.045, 6, 14), new THREE.MeshLambertMaterial({ color: 0xd84040 }));
+        const band = new THREE.Mesh(new THREE.TorusGeometry(0.29, 0.045, 6, 14), toonMat(0xd84040));
         band.rotation.x = Math.PI / 2; band.position.y = 0.13; band.scale.z = 0.8; H.add(band);
-        const knot = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 5), new THREE.MeshLambertMaterial({ color: 0xb83030 }));
+        const knot = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 5), toonMat(0xb83030));
         knot.position.set(0.24, 0.1, -0.1); H.add(knot);
         this.addEye2(H, -1, { y: 0.09, z: 0.27, iris: 0x2a1a0a }); this.addEye2(H, 1, { y: 0.09, z: 0.27, iris: 0x2a1a0a });
         this.addBrows(H, 0x5a3a1a, 0.2, 0.26, 0.4, 0.15);
         break;
       }
       case 'magnus': { // knight: riveted full helm, glowing visor, twin plume
-        const helm = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.28, 0.42, 12), new THREE.MeshLambertMaterial({ color: 0xb8c0cc }));
+        const helm = new THREE.Mesh(new THREE.CylinderGeometry(0.26, 0.28, 0.42, 12), toonMat(0xb8c0cc));
         H.add(helm);
         const dome = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 8, 0, Math.PI * 2, 0, Math.PI * 0.5),
-          new THREE.MeshLambertMaterial({ color: 0xc8d0dc }));
+          toonMat(0xc8d0dc));
         dome.position.y = 0.21; H.add(dome);
         const visor = new THREE.Mesh(new THREE.BoxGeometry(0.37, 0.09, 0.06), new THREE.MeshBasicMaterial({ color: 0x18181e }));
         visor.position.set(0, 0.06, 0.25); H.add(visor);
@@ -829,35 +925,35 @@ export class KartVisual {
         // rivets along the helm
         for (const s of [-1, 1]) {
           for (let i = 0; i < 3; i++) {
-            const riv = new THREE.Mesh(new THREE.SphereGeometry(0.02, 5, 4), new THREE.MeshLambertMaterial({ color: 0x707a88 }));
+            const riv = new THREE.Mesh(new THREE.SphereGeometry(0.02, 5, 4), toonMat(0x707a88));
             riv.position.set(s * 0.24, 0.12 - i * 0.11, 0.1); H.add(riv);
           }
         }
         // twin plume
         for (const s of [-1, 1]) {
-          const plume = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.4, 6), new THREE.MeshLambertMaterial({ color: 0xe8324a }));
+          const plume = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.4, 6), toonMat(0xe8324a));
           plume.position.set(s * 0.07, 0.45, -0.05); plume.rotation.x = -0.3; plume.rotation.z = s * 0.18; H.add(plume);
         }
         break;
       }
       case 'gigi': { // mammoth calf: segmented trunk, tusks, big soft ears
-        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.32, 12, 10), new THREE.MeshLambertMaterial({ color: 0xc8a88a }));
+        const headM = new THREE.Mesh(new THREE.SphereGeometry(0.32, 12, 10), toonMat(0xc8a88a));
         H.add(headM);
         // trunk: two segments curving down
-        const trunk1 = new THREE.Mesh(new THREE.CapsuleGeometry(0.085, 0.2, 4, 8), new THREE.MeshLambertMaterial({ color: 0xb8987a }));
+        const trunk1 = new THREE.Mesh(new THREE.CapsuleGeometry(0.085, 0.2, 4, 8), toonMat(0xb8987a));
         trunk1.position.set(0, -0.1, 0.3); trunk1.rotation.x = 1.0; H.add(trunk1);
-        const trunk2 = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.16, 4, 8), new THREE.MeshLambertMaterial({ color: 0xb8987a }));
+        const trunk2 = new THREE.Mesh(new THREE.CapsuleGeometry(0.06, 0.16, 4, 8), toonMat(0xb8987a));
         trunk2.position.set(0, -0.26, 0.42); trunk2.rotation.x = 1.7; H.add(trunk2);
         for (const s of [-1, 1]) {
-          const tusk = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.32, 6), new THREE.MeshLambertMaterial({ color: 0xf2ead8 }));
+          const tusk = new THREE.Mesh(new THREE.ConeGeometry(0.045, 0.32, 6), toonMat(0xf2ead8));
           tusk.position.set(s * 0.17, -0.1, 0.26); tusk.rotation.x = 0.9; tusk.rotation.z = s * 0.35; H.add(tusk);
-          const ear = new THREE.Mesh(new THREE.CircleGeometry(0.2, 10), new THREE.MeshLambertMaterial({ color: 0xb8987a, side: THREE.DoubleSide }));
+          const ear = new THREE.Mesh(new THREE.CircleGeometry(0.2, 10), toonMat(0xb8987a, { side: THREE.DoubleSide }));
           ear.position.set(s * 0.3, 0.08, -0.02); ear.rotation.y = s * 1.2; H.add(ear);
-          const earIn = new THREE.Mesh(new THREE.CircleGeometry(0.13, 8), new THREE.MeshLambertMaterial({ color: 0xe8c8b0, side: THREE.DoubleSide }));
+          const earIn = new THREE.Mesh(new THREE.CircleGeometry(0.13, 8), toonMat(0xe8c8b0, { side: THREE.DoubleSide }));
           earIn.position.set(s * 0.3, 0.08, -0.015); earIn.rotation.y = s * 1.2; H.add(earIn);
         }
         // hair tuft on top
-        const tuft = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.2, 5), new THREE.MeshLambertMaterial({ color: 0x8a6a4a }));
+        const tuft = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.2, 5), toonMat(0x8a6a4a));
         tuft.position.set(0, 0.33, 0.05); tuft.rotation.x = 0.3; H.add(tuft);
         this.addEye2(H, -1, { x: 0.13, y: 0.09, z: 0.27, iris: 0x3a2a1a, r: 0.085 });
         this.addEye2(H, 1, { x: 0.13, y: 0.09, z: 0.27, iris: 0x3a2a1a, r: 0.085 });
@@ -897,8 +993,9 @@ export class KartVisual {
   update(dt: number, t: number, v: VisualState): void {
     this.animT += dt;
 
-    // suspension spring (visual)
-    this.bounceVel += (-this.bounce * 90 - this.bounceVel * 12) * dt;
+    // suspension spring (visual) — the ground drift engages with a weight
+    // pop (no hop: the kart squats and digs in instead of leaving the road)
+    this.bounceVel += ((-this.bounce - v.driftKick * 0.16) * 90 - this.bounceVel * 12) * dt;
     this.bounce += this.bounceVel * dt;
     if (this.wasAirborne && v.grounded) { this.bounceVel = -1.2; }
     this.wasAirborne = v.airborne;
@@ -926,18 +1023,39 @@ export class KartVisual {
     }
     this.body.rotation.z = THREE.MathUtils.lerp(this.body.rotation.z, -v.steer * (0.055 + driftLean), 0.5) + trickRollZ;
     this.body.position.y = this.bounce + (v.grounded ? Math.sin(t * 9) * 0.012 * (0.3 + v.speedRatio) : 0);
-    this.body.rotation.x = (v.boost ? -0.03 : 0.01) + trickPitchX;
+    // gliding: nose up under the canopy (after the stunt rotation settles)
+    const glidePitch = v.glider > 0 ? 0.14 * v.glider : 0;
+    this.body.rotation.x = (v.boost ? -0.03 : 0.01) + trickPitchX + glidePitch;
+
+    // ---- glider / parachute ------------------------------------------------
+    this.glider.visible = v.glider > 0.001;
+    if (v.glider > 0.001) {
+      // springy pop with a little overshoot
+      const p = v.glider;
+      const overshoot = 1 + Math.sin(Math.min(1, p) * Math.PI) * 0.18;
+      const pop = THREE.MathUtils.lerp(0.18, 1, p) * overshoot;
+      this.glider.scale.setScalar(pop);
+      this.glider.rotation.z = Math.sin(t * 2.1) * 0.07 - v.steer * 0.22;
+      this.glider.rotation.x = -0.1 + Math.sin(t * 1.6) * 0.035;
+      this.glider.position.y = 2.5 + Math.sin(t * 1.3) * 0.06;
+    }
 
     // character animation
     const lean = v.steer * 0.22 + (v.drifting ? 0.3 : 0);
     this.torso.rotation.z = THREE.MathUtils.lerp(this.torso.rotation.z, -lean, dt * 8);
-    this.torso.rotation.x = v.boost ? -0.12 : 0.05 + Math.sin(t * 4) * 0.02;
+    this.torso.rotation.x = (v.boost ? -0.12 : 0.05 + Math.sin(t * 4) * 0.02) + (v.glider > 0 ? -0.1 * v.glider : 0);
     this.head.rotation.z = -lean * 0.5;
     this.head.rotation.y = lean * 0.8;
-    // hands follow the wheel through the turn (subtle but sells the drive)
+    // hands follow the wheel through the turn (subtle but sells the drive);
+    // under the canopy both arms reach UP to the risers (MK glider pose)
     const wheelTurn = v.steer * 0.3 + (v.drifting ? Math.sign(v.steer || 1) * 0.18 : 0);
     this.armL.rotation.y = THREE.MathUtils.lerp(this.armL.rotation.y, wheelTurn, dt * 10);
     this.armR.rotation.y = THREE.MathUtils.lerp(this.armR.rotation.y, wheelTurn, dt * 10);
+    if (v.glider > 0.01 && this.anim === 'idle') {
+      const up = v.glider;
+      this.armL.rotation.z = THREE.MathUtils.lerp(this.armL.rotation.z, 2.25 * up, dt * 9);
+      this.armR.rotation.z = THREE.MathUtils.lerp(this.armR.rotation.z, -2.25 * up, dt * 9);
+    }
     // chin tuck at full boost, alert bob while drifting
     this.head.rotation.x = (v.boost ? 0.14 : 0) + Math.sin(t * (v.drifting ? 11 : 3.2)) * (v.drifting ? 0.05 : 0.02);
 

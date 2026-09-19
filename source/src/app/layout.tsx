@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Bungee, Baloo_2 } from "next/font/google";
 import "./globals.css";
 import { Toaster } from "@/components/ui/toaster";
 
@@ -11,6 +11,21 @@ const geistSans = Geist({
 const geistMono = Geist_Mono({
   variable: "--font-geist-mono",
   subsets: ["latin"],
+});
+
+/** APEX KART display + UI faces: Bungee for the chunky arcade logo &
+ * headlines, Baloo 2 for rounded game-UI text (with solid system fallbacks). */
+const bungee = Bungee({
+  weight: "400",
+  subsets: ["latin"],
+  variable: "--font-display",
+  display: "swap",
+});
+
+const baloo = Baloo_2({
+  subsets: ["latin"],
+  variable: "--font-body",
+  display: "swap",
 });
 
 export const metadata: Metadata = {
@@ -42,7 +57,7 @@ export default function RootLayout({
   return (
     <html lang="es" suppressHydrationWarning>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased bg-black text-white overflow-hidden`}
+        className={`${geistSans.variable} ${geistMono.variable} ${bungee.variable} ${baloo.variable} antialiased bg-black text-white overflow-hidden`}
       >
         {children}
         <Toaster />

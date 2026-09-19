@@ -106,6 +106,7 @@ export class GhostPlayer {
     this.visual.update(1 / 60, t, {
       speedRatio: 0.7, steer: 0, drifting: false, driftLevel: 0,
       grounded: true, boost: false, shrink: false, airborne: false, trickSpin: 0, trickKind: 0,
+      glider: 0, driftKick: 0,
     });
   }
 
