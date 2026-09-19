@@ -1,0 +1,903 @@
+     1→/**
+     2→ * APEX KART — AI drivers.
+     3→ *
+     4→ * Design: drive the precomputed racing line (apex-cutting lat + physical
+     5→ * speed profile with braking distances baked in), then behave like racers:
+     6→ *  - pure-pursuit steering (PD on heading error, correct screen convention)
+     7→ *  - brake BEFORE corners, power out of them (profile does the math)
+     8→ *  - overtake slower karts on the emptier side, with hysteresis
+     9→ *  - dodge sweeping hazards (movers), respect closing gates
+    10→ *  - drift through long corners, release at max charge
+    11→ *  - grab item boxes when empty-handed, use items tactically
+    12→ *  - risk-assessed shortcuts, stuck detection & reverse recovery
+    13→ *  - rubber-banding (tunable; only "unfair" at 150cc)
+    14→ *
+    15→ * Steering sign convention (matches KartController):
+    16→ *   positive steer = turn right on screen = yaw DECREASES,
+    17→ *   so steer = -(Kp*err - Kd*yawRate).
+    18→ */
+    19→
+    20→import * as THREE from 'three';
+    21→import { AIPersonality, KartControls } from '../core/Types';
+    22→import { AI, PHYS } from '../core/Config';
+    23→import { clamp, makeRng, angleDelta } from '../core/MathUtils';
+    24→import { KartController } from '../karts/KartController';
+    25→import { OpenPath, Spline } from '../tracks/Spline';
+    26→import { RacingLine } from '../tracks/TrackBuilder';
+    27→import { HazardInstance } from '../tracks/TrackBuilder';
+    28→
+    29→interface PersonalityParams {
+    30→  speedMult: number;
+    31→  shortcutChance: number;
+    32→  itemAggro: number;      // 0..1 how eagerly offensive items are fired
+    33→  lineJitter: number;     // lateral wandering
+    34→  holdShield: number;     // 0..1 tendency to keep defensive items
+    35→  cornerSkill: number;    // fraction of the profile corner speed used
+    36→}
+    37→
+    38→// COMPETENCE TIERS, NOT SPEED TIERS: every bot has the same engine (1.00
+    39→// speedMult) — the good ones are good because they corner harder, hold a
+    40→// cleaner line, drift better and use items smarter. "Faster bots" felt
+    41→// like rubber-banding; "sharper bots" reads as skill.
+    42→// v2 (skill pass): corner speeds pushed to the real grip limit (the profile
+    43→// has margin baked in), lines cleaned up (less wandering), item play
+    44→// sharper — the pack now genuinely races the player instead of escorting.
+    45→const PERSONALITIES: Record<AIPersonality, PersonalityParams> = {
+    46→  // shortcutChance 0: shortcuts stay a PLAYER tool — the open-rail windows
+    47→  // around branch entries were the #1 source of AI void falls.
+    48→  aggressive: { speedMult: 1.00, shortcutChance: 0.0, itemAggro: 0.55, lineJitter: 0.22, holdShield: 0.28, cornerSkill: 1.00 },
+    49→  defensive:  { speedMult: 1.00, shortcutChance: 0.0, itemAggro: 0.34, lineJitter: 0.16, holdShield: 0.68, cornerSkill: 0.965 },
+    50→  reckless:   { speedMult: 1.00, shortcutChance: 0.0, itemAggro: 0.64, lineJitter: 0.34, holdShield: 0.12, cornerSkill: 1.02 },
+    51→};
+    52→
+    53→export interface AICtx {
+    54→  spline: Spline;
+    55→  shortcuts: OpenPath[];
+    56→  line: RacingLine;            // per-sample racing line (lat + vMax)
+    57→  hazards: HazardInstance[];   // movers/gates to dodge
+    58→  boxes: THREE.Vector3[];      // active item box positions
+    59→  karts: KartController[];     // rivals (overtaking)
+    60→  playerTotalProgress: number; // meters
+    61→  aiTotalProgress: number;     // this kart, meters
+    62→  rubberBand: number;          // 0..1 configured slider
+    63→  unfair: boolean;             // 150cc "unfair" catch-up
+    64→  difficulty: number;          // 50/100/150
+    65→  itemsEnabled: boolean;
+    66→  /** per-track AI pace shaping (TrackDef.aiSpeedScale) */
+    67→  trackSpeedScale?: number;
+    68→  time: number;
+    69→  /** seconds since GO (negative during countdown) — fuels skill starts */
+    70→  goElapsed?: number;
+    71→  /** active coins (track s 0..1 + lateral m) — pace economy, swept en route */
+    72→  coins?: { s: number; lat: number }[];
+    73→  /** live goo/mines to dodge (track s 0..1 + lateral m + owner) */
+    74→  traps?: { s: number; lat: number; ownerId: string }[];
+    75→}
+    76→
+    77→const NEUTRAL: KartControls = {
+    78→  throttle: 0, brake: 0, steer: 0, drift: false, driftRelease: false, fireItem: false, itemHeld: false, lookBack: false,
+    79→};
+    80→
+    81→export class AIDriver {
+    82→  readonly kart: KartController;
+    83→  readonly personality: AIPersonality;
+    84→  private params: PersonalityParams;
+    85→  private rng: () => number;
+    86→  private wander = 0;               // current lateral wander offset
+    87→  private retargetIn = 0;
+    88→  private itemThinkIn = 0;
+    89→  private aiDrift = false;
+    90→  private driftReleaseTimer = 0;
+    91→  /** true once the current slide has actually ENTERED the slow zone — the
+    92→   *  approach straight must not count as "corner over" (vNow is still high) */
+    93→  private driftInCorner = false;
+    94→  private itemHoldTime = 0;
+    95→  private skill: number;            // permanent speed skill jitter
+    96→  private lastYaw = 0;
+    97→
+    98→  // overtake state
+    99→  private overtakeT = 0;
+   100→  private overtakeSide = 0;
+   101→  private offRoad = false;
+   102→  private followSpeed = Infinity;
+   103→  // stable U-turn direction when badly disoriented (err near +-pi flips
+   104→  // sign every frame through the wrap — a locked turn direction fixes the
+   105→  // pirouette-on-the-spot failure mode)
+   106→  private turnLock = 0;
+   107→  // telemetry for QA debugging
+   108→  dbg = { targetSpeed: 0, steer: 0, err: 0, throttle: 1, brake: 0, vMaxHere: 0, follow: Infinity };
+   109→
+   110→  // stuck / recovery state
+   111→  private stuckT = 0;
+   112→  /** seconds of zero progress near a jump gap (lifts the gap protections) */
+   113→  private gapStallT = 0;
+   114→  private reversing = 0;
+   115→  // PROGRESS-based stuck detection: wheelspeed lies (rail-grind locks and
+   116→  // soft piles show 2-7 m/s of wheelspin with ZERO forward progress), so
+   117→  // the window below tracks how much TRACK actually advanced lately.
+   118→  private progPrev = 0;
+   119→  private progWindow: number[] = [];
+   120→  private progSampleIn = 0;
+   121→  // race-start skill (well-timed launch boost, like the player's)
+   122→  private startSkill = 0;
+   123→  private startBoostUsed = false;
+   124→  // spin-recovery window for item decisions (burn a boost to re-pace)
+   125→  private spinRecover = 0;
+   126→  /** random 0..6 s offset for the universal stall-respawn — serializes pile
+   127→   *  escapes so a welded group doesn't respawn simultaneously into itself */
+   128→  private stallEscapeOffset = 0;
+   129→  // offroad wallow: stalled beside the road this long → courtesy respawn
+   130→  // (hairpin overshoots & switchback confusion kept half the field crawling)
+   131→  private offroadStallT = 0;
+   132→  // grace after a wallow respawn — the kart re-enters the SAME zone it died
+   133→  // in, at crawl speed; without grace it re-triggers forever (respawn loop)
+   134→  private wallowGrace = 0;
+   135→
+   136→  // shortcut commitment (idx → {ok, refresh})
+   137→  private scCommit: { ok: boolean; until: number }[] = [];
+   138→
+   139→  constructor(kart: KartController, personality: AIPersonality, seed: number) {
+   140→    this.kart = kart;
+   141→    this.personality = personality;
+   142→    this.params = PERSONALITIES[personality];
+   143→    this.rng = makeRng(seed);
+   144→    this.wander = (this.rng() * 2 - 1) * AI.targetJitter;
+   145→    // tiny pace jitter — the spread comes from cornering skill, not top
+   146→    // speed. Some natural spread is GOOD: it de-conflicts the pack into a
+   147→    // train instead of a 12-wide wall into corner 1.
+   148→    this.skill = 0.988 + this.rng() * 0.024;
+   149→    this.startSkill = this.rng();
+   150→    this.stallEscapeOffset = this.rng() * 6;
+   151→  }
+   152→
+   153→  /** Rubber-band speed multiplier from gap to the player. */
+   154→  private rubberMult(ctx: AICtx): number {
+   155→    const gap = ctx.playerTotalProgress - ctx.aiTotalProgress; // + = AI behind player
+   156→    const f = clamp(gap / AI.rubberRange, -1, 1);
+   157→    let mult = 1;
+   158→    if (f > 0) {
+   159→      const behind = ctx.unfair ? AI.unfairBehind : (AI.rubberBehind[ctx.difficulty] ?? 0.12);
+   160→      mult = 1 + behind * f * ctx.rubberBand;
+   161→    } else if (f < 0) {
+   162→      mult = 1 - AI.rubberAhead * (-f) * ctx.rubberBand;
+   163→    }
+   164→    return mult;
+   165→  }
+   166→
+   167→  update(dt: number, ctx: AICtx): KartControls {
+   168→    const k = this.kart;
+   169→    const sp = ctx.spline;
+   170→    const gi = k.ginfo;
+   171→    const N = sp.samples.length;
+   172→    if (!gi) return NEUTRAL;
+   173→
+   174→    const speed = Math.abs(k.speed);
+   175→
+   176→    // ---- race-start skill: the good starters hit the launch window ------
+   177→    // (same 260 ms window the player has; skill decides who nails it)
+   178→    if (ctx.goElapsed !== undefined && !this.startBoostUsed) {
+   179→      // ~60% of the field nails the launch (was ~55%) — enough to make
+   180→      // starts feel raced without bunching the whole grid into corner 1
+   181→      if (ctx.goElapsed > 0 && ctx.goElapsed < 0.26 && this.startSkill > 0.45) {
+   182→        k.applyBoost(0.85, 1.14 + (this.startSkill - 0.45) * 0.3);
+   183→        this.startBoostUsed = true;
+   184→      } else if (ctx.goElapsed > 0.3) {
+   185→        this.startBoostUsed = true;
+   186→      }
+   187→    }
+   188→    this.spinRecover = k.spinT > 0 ? 1.6 : Math.max(0, this.spinRecover - dt);
+   189→
+   190→    // ---------------- stuck detection & reverse recovery -------------------
+   191→    // Queues are NOT stuck: never reverse while waiting for a closing gate
+   192→    // OR while another kart is just ahead (gate/chicane traffic jams would
+   193→    // otherwise dissolve into reverse-into-queue chaos).
+   194→    let gateAheadClosed = false;
+   195→    for (const h of ctx.hazards) {
+   196→      if (h.def.kind !== 'gate') continue;
+   197→      const dS = Spline.wrapS(h.def.at - gi.s) * sp.length;
+   198→      if (dS > 0.5 && dS < 18) { gateAheadClosed = true; break; }
+   199→    }
+   200→    let liveQueueAhead = false;
+   201→    for (const other of ctx.karts) {
+   202→      if (other === k || other.battleKo || other.finished) continue;
+   203→      // 2D proximity (side-by-side jams share track progress but still block
+   204→      // each other — pure dS misses them). Only a MOVING kart blocks the
+   205→      // stuck-recovery: a stationary neighbor means we're in a wreck PILE,
+   206→      // and piles need the reverse to untangle (blocking it there welded
+   207→      // whole grids together at chicane entries forever).
+   208→      const dx = other.pos.x - k.pos.x, dz = other.pos.z - k.pos.z;
+   209→      if (dx * dx + dz * dz < 5 * 5 && Math.abs(other.speed) > 4) { liveQueueAhead = true; break; }
+   210→    }
+   211→    // NEVER trigger the reverse recovery near a jump gap: karts brake and
+   212→    // queue after landings (racing-line profile), and reversing there loops
+   213→    // back INTO the gap — fall, respawn past, queue, reverse, forever.
+   214→    let gapNear = false;
+   215→    {
+   216→      const N2 = sp.samples.length;
+   217→      const here = ((gi.mainIdx % N2) + N2) % N2;
+   218→      for (let d = -6; d <= 18; d += 2) {
+   219→        if (sp.samples[((here + d) % N2 + N2) % N2].jump) { gapNear = true; break; }
+   220→      }
+   221→    }
+   222→    // PILE-AWARE: a wreck pile sits in equilibrium at 3-5 m/s (everyone
+   223→    // full-throttling into everyone at the same target). That counts as
+   224→    // stuck ONLY with slow neighbors welded nearby — a lone kart at 5 m/s
+   225→    // is just exiting a hairpin.
+   226→    let inPile = false;
+   227→    if (speed < 6) {
+   228→      let slowNeighbors = 0;
+   229→      for (const other of ctx.karts) {
+   230→        if (other === k || other.battleKo || other.finished) continue;
+   231→        const dx = other.pos.x - k.pos.x, dz = other.pos.z - k.pos.z;
+   232→        if (dx * dx + dz * dz < 5 * 5 && Math.abs(other.speed) < 5) slowNeighbors++;
+   233→      }
+   234→      inPile = slowNeighbors >= 2;
+   235→    }
+   236→    // progress window: ~4 samples/s, last ~2.6 s of unwrapped track meters
+   237→    this.progSampleIn -= dt;
+   238→    if (this.progSampleIn <= 0) {
+   239→      this.progSampleIn = 0.25;
+   240→      const sNow = gi.s * ctx.spline.length;
+   241→      let d = sNow - this.progPrev;
+   242→      if (d < -ctx.spline.length * 0.5) d += ctx.spline.length;
+   243→      else if (d > ctx.spline.length * 0.5) d -= ctx.spline.length;
+   244→      this.progPrev = sNow;
+   245→      this.progWindow.push(d);
+   246→      if (this.progWindow.length > 10) this.progWindow.shift();
+   247→    }
+   248→    const progAdvanced = this.progWindow.length >= 8
+   249→      ? this.progWindow.reduce((a, b) => a + b, 0) : Infinity;
+   250→    const stalled = progAdvanced < 5; // < 5 m of track in ~2 s while "driving"
+   251→    // The gap-near protection must not hold a WELDED kart forever: karts
+   252→    // pinned at the rail / in a pile next to a jump gap used to be excluded
+   253→    // from BOTH the reverse recovery and the wallow respawn — an escape-proof
+   254→    // trap on switchback+gap combos (glacier). After 5 s of zero progress the
+   255→    // protections lift (respawn anchors are already placed past every gap,
+   256→    // and a 0 m/s reverse can't loop into anything).
+   257→    if (stalled && speed < 9) this.gapStallT += dt;
+   258→    else this.gapStallT = Math.max(0, this.gapStallT - dt * 2);
+   259→    const gapHardBlock = gapNear && this.gapStallT < 5;
+   260→    // RAIL-GRIND EXEMPTION: reversing while pinned against the guardrail is
+   261→    // counterproductive — the rescue below (deep inward target at low speed)
+   262→    // is the only thing that peels a kart off the wall. Let it work instead
+   263→    // of flip-flopping reverse↔forward against the clamp.
+   264→    const grinding = k.railGrindT > 1.0;
+   265→    if ((speed < 1.5 || inPile || (stalled && speed < 9)) && !grinding
+   266→      && !k.finished && !gateAheadClosed && !liveQueueAhead && !gapHardBlock) this.stuckT += dt * (stalled ? 1.6 : 1);
+   267→    else this.stuckT = Math.max(0, this.stuckT - dt * 2.5);
+   268→    // OFFROAD WALLOW RESPAWN: karts crawling off the road (hairpin
+   269→    // overshoot, switchback confusion, rail pinning) get the void-fall
+   270→    // courtesy after 7 s. Threshold is 6.5 m/s — ice/hairpin pacing dips
+   271→    // to 10-12 legitimately, only a true crawl counts. Karts clamped on
+   272→    // the rail for 6+ s respawn immediately. A 12 s grace after each
+   273→    // respawn prevents re-triggering inside the very zone they died in.
+   274→    this.wallowGrace = Math.max(0, this.wallowGrace - dt);
+   275→    // UNIVERSAL STALL ESCAPE: welded traffic piles ON the road (switchback +
+   276→    // rail compressions of 5+ karts) can't untangle via the 0.9 s reverse —
+   277→    // karts just re-ram each other. A kart with ~8 s of zero track progress
+   278→    // respawns at its anchor regardless of surface. Slight cheat-skip vs
+   279→    // being welded forever: always the better trade.
+   280→    // PILE-AWARE STAGGER: when a whole pile trips the escape at once,
+   281→    // simultaneous respawns land back INTO the same jam and re-weld (the
+   282→    // glacier switchback deadlock) — serialize them by a random offset. A
+   283→    // LONE stalled kart (no slow neighbors) rescues immediately: the
+   284→    // stagger must never slow down individual recoveries.
+   285→    if (this.gapStallT > 8 && !k.finished && this.wallowGrace <= 0) {
+   286→      let stalledNeighbors = 0;
+   287→      for (const other of ctx.karts) {
+   288→        if (other === k || other.battleKo || other.finished) continue;
+   289→        if (Math.abs(other.speed) > 6) continue;
+   290→        const dS = Spline.wrapS(other.progressS - k.progressS) * ctx.spline.length;
+   291→        if (Math.abs(dS) < 15) stalledNeighbors++;
+   292→      }
+   293→      const stagger = stalledNeighbors >= 2 ? this.stallEscapeOffset : 0;
+   294→      if (this.gapStallT > 8 + stagger) {
+   295→        k.requestRespawn = true;
+   296→        this.gapStallT = 0;
+   297→        this.stuckT = 0;
+   298→        this.offroadStallT = 0;
+   299→        this.wallowGrace = 12;
+   300→      }
+   301→    }
+   302→    const wallowing = !gi.onRoad && gi.onShortcut < 0 && !k.finished
+   303→      && (!gapNear || k.railGrindT > 6 || this.gapStallT > 5)
+   304→      && (speed < 6.5 || k.railGrindT > 6) && this.wallowGrace <= 0;
+   305→    if (wallowing) {
+   306→      this.offroadStallT += dt;
+   307→      if (this.offroadStallT > 7 || k.railGrindT > 6) {
+   308→        k.requestRespawn = true;
+   309→        this.offroadStallT = 0;
+   310→        this.stuckT = 0;
+   311→        this.wallowGrace = 12;
+   312→      }
+   313→    } else {
+   314→      this.offroadStallT = Math.max(0, this.offroadStallT - dt * 2);
+   315→    }
+   316→    if (this.stuckT > 1.8 && this.reversing <= 0) {
+   317→      this.reversing = 0.9;   // brief untangle, never a long grind through traffic
+   318→      this.stuckT = 0;
+   319→      // ESCAPE LANE: after untangling, drive AROUND the pile on the side
+   320→      // with fewer neighbors — returning to the same racing-line target
+   321→      // just re-joined the blob we just left.
+   322→      let leftN = 0, rightN = 0;
+   323→      for (const other of ctx.karts) {
+   324→        if (other === k || other.battleKo || other.finished) continue;
+   325→        const dS = Spline.wrapS(other.progressS - gi.s) * sp.length;
+   326→        if (dS < -2 || dS > 14) continue;
+   327→        const oLat = other.ginfo?.lateral ?? 0;
+   328→        if (oLat < gi.lateral - 1) leftN++;
+   329→        else if (oLat > gi.lateral + 1) rightN++;
+   330→      }
+   331→      this.overtakeSide = leftN <= rightN ? -1 : 1;
+   332→      this.overtakeT = 2.8;
+   333→    }
+   334→    if (this.reversing > 0) {
+   335→      this.reversing -= dt;
+   336→      const smHere = sp.sampleAt(gi.s);
+   337→      const desiredYaw = Math.atan2(smHere.tangent.x, smHere.tangent.z); // keep nose aligned with the road
+   338→      const err = angleDelta(k.yaw, desiredYaw);
+   339→      return {
+   340→        throttle: 0, brake: 1,
+   341→        steer: clamp(-(err * 3.5), -1, 1),
+   342→        drift: false, driftRelease: false, fireItem: false, itemHeld: false, lookBack: false,
+   343→      };
+   344→    }
+   345→
+   346→    // ---------------- pick a steering target -------------------------------
+   347→    // Adaptive pure-pursuit: the lookahead grows with speed AND with the
+   348→    // kart's lateral offset. A fixed 6-16 m lookahead gave wide-pushed karts
+   349→    // a target that sat LATERALLY BEHIND them (err ~1-2 rad) — they orbited
+   350→    // it in U-turn ping-pong instead of merging back (the square-dance
+   351→    // gridlock). Looking 1.6x further per meter of offset makes the merge
+   352→    // geometry convergent.
+   353→    const latAbs = Math.abs(gi.lateral);
+   354→    const lookM = AI.lookaheadNear + clamp(speed / 22, 0, 1) * (AI.lookaheadFar - AI.lookaheadNear)
+   355→      + Math.min(16, latAbs * 1.6);
+   356→    const lookS = Spline.wrapS(gi.s + lookM / sp.length);
+   357→    const lookIdx = sp.indexAtS(lookS);
+   358→    const myIdx = ((gi.mainIdx % N) + N) % N;
+   359→    const hw = sp.samples[lookIdx].halfWidth;
+   360→
+   361→    let target = new THREE.Vector3();
+   362→    // two-point line sampling: blending the line offset at two lookaheads
+   363→    // smooths chicane transitions (a single point zig-zags the steering)
+   364→    const lookIdx2 = sp.indexAtS(Spline.wrapS(lookS + 7 / sp.length));
+   365→    let lat = (ctx.line.lat[lookIdx] ?? 0) * 0.72 + (ctx.line.lat[lookIdx2] ?? 0) * 0.28;
+   366→
+   367→    // wander (personality-flavored racing line deviation)
+   368→    this.retargetIn -= dt;
+   369→    if (this.retargetIn <= 0) {
+   370→      this.retargetIn = 2.2 + this.rng() * 2.8;
+   371→      this.wander = (this.rng() * 2 - 1) * AI.targetJitter * this.params.lineJitter * 2;
+   372→    }
+   373→    lat += this.wander;
+   374→
+   375→    const onShortcut = gi.onShortcut >= 0;
+   376→    let aimingJump = false;
+   377→    if (onShortcut) {
+   378→      // follow the shortcut polyline: point just ahead by mapped progress
+   379→      const path = ctx.shortcuts[gi.onShortcut];
+   380→      let bestPt = path.pts[path.pts.length - 1];
+   381→      let bestAhead = Infinity;
+   382→      for (const pt of path.pts) {
+   383→        let ahead = pt.mappedS - gi.s;
+   384→        if (ahead < -0.5) ahead += 1; // handle exit wrap
+   385→        if (ahead >= 0 && ahead < bestAhead) { bestAhead = ahead; bestPt = pt; }
+   386→      }
+   387→      target = bestPt.pos.clone();
+   388→    } else {
+   389→      // ---- jump alignment: aim at the LANDING ZONE center -----------------
+   390→      // Gaps that sit after a bend are approached misaligned; a diagonal
+   391→      // launch misses the landing ribbon. Steer at the first solid sample
+   392→      // past the gap so every flight is straight. Only for karts roughly
+   393→      // facing along the road — a disoriented kart (spun mid-flight by an
+   394→      // item) must U-turn slowly instead of full-throttling backward at the
+   395→      // landing target and diving into the gap in reverse.
+   396→      let jumpIdx = -1;
+   397→      for (let d = 2; d <= 18; d += 2) {
+   398→        const idx = (myIdx + d) % N;
+   399→        if (sp.samples[idx].jump) { jumpIdx = idx; break; }
+   400→      }
+   401→      const smHere = sp.samples[myIdx];
+   402→      const roadYaw = Math.atan2(smHere.tangent.x, smHere.tangent.z);
+   403→      const facingAlongRoad = Math.abs(angleDelta(k.yaw, roadYaw)) < 1.3;
+   404→      if (jumpIdx >= 0 && speed > 10 && facingAlongRoad) {
+   405→        let land = jumpIdx;
+   406→        for (let guard = 0; guard < 40 && sp.samples[land].jump; guard++) land = (land + 1) % N;
+   407→        target = sp.samples[land].pos.clone();
+   408→        aimingJump = true;
+   409→      }
+   410→
+   411→      // ---- shortcut entry decision (committed per branch for a while) ------
+   412→      if (this.scCommit.length !== ctx.shortcuts.length) {
+   413→        this.scCommit = ctx.shortcuts.map(() => ({ ok: false, until: 0 }));
+   414→      }
+   415→      let aimingShortcut = false;
+   416→      let bestSc = -1, bestAheadS = Infinity;
+   417→      for (let i = 0; i < ctx.shortcuts.length; i++) {
+   418→        const aheadS = Spline.wrapS(ctx.shortcuts[i].pts[0].mappedS - gi.s);
+   419→        if (aheadS < bestAheadS) { bestAheadS = aheadS; bestSc = i; }
+   420→      }
+   421→      if (bestSc >= 0) {
+   422→        const commit = this.scCommit[bestSc];
+   423→        const distM = bestAheadS * sp.length;
+   424→        if (distM < 14 && ctx.time > commit.until) {
+   425→          // fresh decision: risk gate by personality + current confidence +
+   426→          // rough alignment with the entry (diving at a branch from a bad
+   427→                   // angle ends in the open-rail window and the void)
+   428→          const entry = ctx.shortcuts[bestSc].pts[0].pos;
+   429→          const entryYaw = Math.atan2(entry.x - k.pos.x, entry.z - k.pos.z);
+   430→          const aligned = Math.abs(angleDelta(k.yaw, entryYaw)) < 0.6;
+   431→          commit.ok = aligned && speed > 13 && this.rng() < this.params.shortcutChance;
+   432→          commit.until = ctx.time + 6;
+   433→        }
+   434→        // lost the window without adopting the branch: drop the commitment
+   435→        if (distM > 34) commit.ok = false;
+   436→        if (distM < 30 && commit.ok) {
+   437→          const sc = ctx.shortcuts[bestSc];
+   438→          // aim at the ENTRY while still on the road, then pull into the branch
+   439→          const deepPt = (sc.pts[Math.min(sc.pts.length - 1, 10)] ?? sc.pts[0]).pos.clone();
+   440→          const entryPt = sc.pts[0].pos.clone();
+   441→          target = distM > 9 ? entryPt : deepPt;
+   442→          aimingShortcut = true;
+   443→        }
+   444→      }
+   445→
+   446→      if (!aimingShortcut && !aimingJump) {
+   447→        // ---- overtake slower karts on the emptier side -----------------------
+   448→        // SKILL, not patience: detect blockers early (16 m), commit to a
+   449→        // side, and pull alongside when the lane is free. Only box in and
+   450→        // queue when someone occupies the pass lane or a hazard forbids it.
+   451→        this.overtakeT -= dt;
+   452→        let blocking: KartController | null = null;
+   453→        let blockD = Infinity;
+   454→        for (const other of ctx.karts) {
+   455→          if (other === k || other.battleKo || other.finished) continue;
+   456→          const dS = Spline.wrapS(other.progressS - gi.s) * sp.length;
+   457→          if (dS < 1.5 || dS > 16) continue;
+   458→          const otherLat = other.ginfo?.lateral ?? 0;
+   459→          if (Math.abs(otherLat - (gi.lateral)) < 2.8) { blocking = other; blockD = dS; break; }
+   460→        }
+   461→        if (blocking && this.overtakeT <= 0) {
+   462→          const blockLat = blocking.ginfo?.lateral ?? 0;
+   463→          // pass on the side with more room (or through the middle)
+   464→          this.overtakeSide = Math.abs(blockLat) < hw * 0.4
+   465→            ? (blockLat >= 0 ? -1 : 1)
+   466→            : -Math.sign(blockLat);
+   467→          this.overtakeT = 1.8 + this.rng() * 1.2;
+   468→        }
+   469→        // is the chosen pass lane actually free?
+   470→        let laneBusy = false;
+   471→        if (blocking && this.overtakeT > 0 && this.overtakeSide !== 0) {
+   472→          const targetLat = this.overtakeSide * (hw - 2.1);
+   473→          for (const other of ctx.karts) {
+   474→            if (other === k || other.battleKo || other.finished) continue;
+   475→            const dS = Spline.wrapS(other.progressS - gi.s) * sp.length;
+   476→            if (dS < -1 || dS > blockD + 3) continue;
+   477→            const oLat = other.ginfo?.lateral ?? 0;
+   478→            if (Math.abs(oLat - targetLat) < 2.6) { laneBusy = true; break; }
+   479→          }
+   480→        }
+   481→        // car-following: match-and-pass when free, queue only when boxed in
+   482→        // (the old blockD*2.2 cap made bots sit 3 m behind leaders forever)
+   483→        if (blocking) {
+   484→          const aheadSpeed = Math.max(0, blocking.speed);
+   485→          this.followSpeed = (laneBusy || gateAheadClosed || gapNear)
+   486→            ? Math.max(2.5, blockD * 1.6 + aheadSpeed * 0.75)
+   487→            : Math.max(aheadSpeed + 1.5, Math.min(k.baseVmax, blockD * 3.0));
+   488→        } else {
+   489→          this.followSpeed = Infinity;
+   490→        }
+   491→        if (this.overtakeT > 0 && this.overtakeSide !== 0) {
+   492→          lat = lat * 0.3 + this.overtakeSide * (hw - 2.1) * 0.7;
+   493→        }
+   494→
+   495→        // ---- dodge sweeping hazards (movers) ---------------------------------
+   496→        for (const h of ctx.hazards) {
+   497→          if (h.def.kind !== 'mover' || !h.active) continue;
+   498→          const dS = Spline.wrapS(h.def.at - gi.s) * sp.length;
+   499→          if (dS < 3 || dS > 26) continue;
+   500→          const sm = sp.sampleAt(h.def.at);
+   501→          const hLat = h.pos.clone().sub(sm.pos).dot(sm.right);
+   502→          if (Math.abs(hLat - lat) < 3.0) {
+   503→            // dodge relative to OUR side of the hazard — karts split both
+   504→            // ways instead of all cramming one dodge lane
+   505→            const away = lat >= hLat ? 1 : -1;
+   506→            lat = hLat + away * 3.6;
+   507→          }
+   508→        }
+   509→
+   510→        // ---- bias toward item boxes when empty-handed -------------------------
+   511→        let wantBox = false;
+   512→        if (!k.itemSlot && k.rouletteUntil <= 0 && ctx.boxes.length) {
+   513→          const here = sp.samples[myIdx];
+   514→          let bestBox: THREE.Vector3 | null = null;
+   515→          let bestD = Infinity;
+   516→          for (const b of ctx.boxes) {
+   517→            const d = b.distanceToSquared(k.pos);
+   518→            if (d < bestD) { bestD = d; bestBox = b; }
+   519→          }
+   520→          if (bestBox && bestD < 15 * 15) {
+   521→            const boxLat = bestBox.clone().sub(here.pos).dot(here.right);
+   522→            if (Math.abs(boxLat) < hw - 1.2) { lat = lat * 0.35 + boxLat * 0.65; wantBox = true; }
+   523→          }
+   524→        }
+   525→
+   526→        // ---- coin vacuum: top speed is +0.8%/coin — sweep the row en route ---
+   527→        // LINE DISCIPLINE first: only coins sitting basically ON the line
+   528→        // (small deviation) — passive collection already nets ~8/10 by
+   529→        // following the racing line; this nudges it to 10 without ever
+   530→        // compromising a corner.
+   531→        if (!wantBox && this.overtakeT <= 0 && ctx.coins?.length) {
+   532→          let bestCoinLat = 0, bestCoinD = Infinity;
+   533→          for (const c of ctx.coins) {
+   534→            const dS = Spline.wrapS(c.s - gi.s) * sp.length;
+   535→            if (dS < 2 || dS > 18) continue;
+   536→            const dev = Math.abs(c.lat - lat);
+   537→            if (dev > 2.6) continue;
+   538→            const cost = dS + dev * 2.2;
+   539→            if (cost < bestCoinD) { bestCoinD = cost; bestCoinLat = c.lat; }
+   540→          }
+   541→          if (bestCoinD < Infinity) lat = lat * 0.45 + bestCoinLat * 0.55;
+   542→        }
+   543→
+   544→        // ---- dodge dropped traps (goo / mines) --------------------------------
+   545→        // A skilled field doesn't plow into hazards it can see — but the
+   546→        // dodge is WIDTH-AWARE and SHORT-RANGE: on twisted sections s-distance
+   547→        // ≠ straight-line distance (a trap "24 m ahead" in s can sit beside
+   548→        // you around a hairpin), and long-range dodges on technical tracks
+   549→        // became phantom swerves that cost more than the trap. 14 m keeps it
+   550→        // to genuinely imminent hazards.
+   551→        if (ctx.traps?.length) {
+   552→          for (const tr of ctx.traps) {
+   553→            if (tr.ownerId === k.id) continue;   // our own trap (armed window)
+   554→            const dS = Spline.wrapS(tr.s - gi.s) * sp.length;
+   555→            if (dS < 1 || dS > 14) continue;
+   556→            if (Math.abs(tr.lat - lat) < 2.5) {
+   557→              const away = lat >= tr.lat ? 1 : -1;
+   558→              const target = tr.lat + away * 3.5;
+   559→              const room = hw - 1.6;             // stay off the rails
+   560→              if (Math.abs(target) <= room) lat = target;
+   561→              // no room? eat it — a spin beats a rail grind pile
+   562→            }
+   563→          }
+   564→        }
+   565→
+   566→        lat = clamp(lat, -(hw - 1.5), hw - 1.5);
+   567→        const sm = sp.sampleAt(lookS);
+   568→        target = sm.pos.clone().addScaledVector(sm.right, lat);
+   569→      }
+   570→
+   571→      // ---- off-road recovery flag -------------------------------------------
+   572→      // Use the CURRENT sample's half width (the lookahead sample can be
+   573→      // wider — landing run-outs — and hid karts pinned at the rail edge:
+   574→      // |lat| 9.0 vs hw+2.5 = 11 meant "on the road" while the kart ground
+   575→      // against the wall 0.5 m off the asphalt). Beyond the rail limit
+   576→      // (hw + 0.6) = aim straight at the road center ahead.
+   577→      const hwHere = sp.samples[myIdx].halfWidth;
+   578→      this.offRoad = !gi.onRoad && gi.onShortcut < 0 && gi.hasGround
+   579→        && Math.abs(gi.lateral) > Math.min(hwHere + 0.6, hw + 1.2);
+   580→      if (this.offRoad) {
+   581→        const recS = Spline.wrapS(gi.s + 10 / sp.length);
+   582→        const rec = sp.sampleAt(recS);
+   583→        target = rec.pos.clone();
+   584→      }
+   585→      // RAIL-GRIND RESCUE: clamped against the guardrail for > 1 s. Chasing
+   586→      // the racing line from here aims shallow (a few degrees inward) and
+   587→      // the road curving away eats that gain — the grind never ends. Aim
+   588→      // DEEP at the road center 30 m ahead instead: at the capped speed the
+   589→      // turning circle is tight enough to actually peel off the wall.
+   590→      if (k.railGrindT > 1.0 && !onShortcut) {
+   591→        const resS = Spline.wrapS(gi.s + 30 / sp.length);
+   592→        target = sp.sampleAt(resS).pos.clone();
+   593→      }
+   594→    }
+   595→
+   596→    // ---------------- steering (pure pursuit PD, screen-correct sign) -------
+   597→    const desiredYaw = Math.atan2(target.x - k.pos.x, target.z - k.pos.z);
+   598→    const err = angleDelta(k.yaw, desiredYaw);
+   599→    const yawRate = dt > 0 ? angleDelta(this.lastYaw, k.yaw) / Math.max(dt, 1e-4) : 0;
+   600→    this.lastYaw = k.yaw;
+   601→    const steer = clamp(-(err * AI.steerKp - yawRate * AI.steerKd), -1, 1);
+   602→
+   603→    // ---------------- speed target from the racing-line profile -------------
+   604→    // The profile's backward pass already guarantees "vMax here = can still
+   605→    // brake for the next corner", so a small lookahead is all we need.
+   606→    const ahead = (myIdx + 2) % N;
+   607→    let targetSpeed = Math.min(
+   608→      (ctx.line.vMax[ahead] ?? 25) * this.params.cornerSkill * (ctx.trackSpeedScale ?? 1),
+   609→      k.baseVmax * this.params.speedMult * this.skill * this.rubberMult(ctx),
+   610→    );
+   611→    const vMaxHere = ctx.line.vMax[myIdx] ?? 25;
+   612→    // recovering from off-road: keep momentum, no panic braking
+   613→    if (this.offRoad) targetSpeed = Math.max(targetSpeed, Math.min(k.baseVmax, 16));
+   614→    // ICE / low-grip surfaces: real racers lift. The profile assumes full
+   615→    // grip; scaling by the live zone grip keeps the line trackable through
+   616→    // ice/mud patches instead of understeering into the wall.
+   617→    if (k.zoneGripNow < 0.85) targetSpeed *= 0.72 + 0.28 * k.zoneGripNow;
+   618→    // rail-grind rescue pace: slow enough that the turning circle shrinks
+   619→    // below the distance to the road center — this is what makes the escape
+   620→    // geometrically possible
+   621→    if (k.railGrindT > 1.0) targetSpeed = Math.min(targetSpeed, 7);
+   622→    // car-following cap (set while scanning for blockers)
+   623→    targetSpeed = Math.min(targetSpeed, this.followSpeed);
+   624→
+   625→    // closing gates: decelerate proportionally to distance (stop AT the wall,
+   626→    // never ram it — ramming bounces back and oscillates forever)
+   627→    for (const h of ctx.hazards) {
+   628→      if (h.def.kind !== 'gate') continue;
+   629→      const dS = Spline.wrapS(h.def.at - gi.s) * sp.length;
+   630→      if (dS > 0.5 && dS < 12 && h.active) {
+   631→        targetSpeed = Math.min(targetSpeed, Math.max(0.8, dS * 0.9));
+   632→      }
+   633→    }
+   634→
+   635→    // jump gaps: carry enough speed to fly them (launch ramps convert the
+   636→    // climb to vy, so ~22 m/s clears every authored gap with margin)
+   637→    for (let d = 2; d <= 18; d += 2) {
+   638→      if (sp.samples[(myIdx + d) % N].jump) {
+   639→        targetSpeed = Math.max(targetSpeed, 22);
+   640→        break;
+   641→      }
+   642→    }
+   643→
+   644→    const facingWrong = Math.abs(err) > 2.1 && !aimingJump && !this.offRoad;
+   645→    let throttle = 1, brake = 0;
+   646→    if (facingWrong) {
+   647→      // lock a U-turn direction until the error unwraps
+   648→      if (!this.turnLock) this.turnLock = -Math.sign(err) || 1;
+   649→      // CREEP, don't donut: at ~4 m/s the turning circle shrinks to under
+   650→      // 2 m, so the U-turn actually closes instead of orbiting the target.
+   651→      // Full emergency brake while over twice the cap: a boosted disoriented
+   652→      // kart used to plow back through the pack at 40 m/s wrecking everyone.
+   653→      throttle = 0;
+   654→      brake = speed > 8 ? 1 : 0;
+   655→      targetSpeed = Math.min(targetSpeed, 4.5);
+   656→    } else if (Math.abs(err) < 1.4) {
+   657→      this.turnLock = 0;
+   658→    }
+   659→    if (!this.offRoad && speed > targetSpeed * 1.18) { throttle = 0; brake = clamp((speed - targetSpeed) / 9, 0, 0.85); }
+   660→    else if (!this.offRoad && speed > targetSpeed) throttle = 0.55;
+   661→
+   662→    // ---------------- drift through long corners -----------------------------
+   663→    // CORNER DEMAND from the speed profile, measured at the actual braking
+   664→    // distance (v²/2a) — bots commit to the slide exactly when a real driver
+   665→    // would, and RELEASE ON EXIT so the mini-turbo fires corner-out (that
+   666→    // exit boost is where skilled racers make their time).
+   667→    const brakeDist = Math.max(4, speed * speed / 26);
+   668→    const samplesPerMeter = N / ctx.spline.length;
+   669→    const aheadN = Math.max(2, Math.min(26, Math.round(brakeDist * samplesPerMeter)));
+   670→    const vAhead = ctx.line.vMax[(myIdx + aheadN) % N] ?? 25;
+   671→    const vNow = ctx.line.vMax[myIdx] ?? 25;
+   672→    const cornerAhead = vAhead < k.baseVmax * 0.72 || vNow < k.baseVmax * 0.72;
+   673→    const exiting = vAhead > vNow + 0.5;
+   674→    const wantDrift = cornerAhead && speed > PHYS.driftEnterSpeed + 1 && !facingWrong && !onShortcut;
+   675→    if (wantDrift && !this.aiDrift) {
+   676→      this.aiDrift = true;
+   677→      this.driftReleaseTimer = 0;
+   678→    }
+   679→    if (this.aiDrift) {
+   680→      this.driftReleaseTimer += dt;
+   681→      // SKILL (minimal-delta): when aligned, hold the slide a beat longer
+   682→      // to bank at least a level-1 mini-turbo (charge needs ~0.9-1.0 s of
+   683→      // active slide). Corner-over and full-charge still release instantly;
+   684→      // the entry logic is untouched (proven stable on the switchbacks).
+   685→      const shouldRelease =
+   686→        Math.abs(err) < 0.1
+   687→        || (exiting && k.driftLevel >= 1)
+   688→        || k.driftLevel >= 3
+   689→        || !cornerAhead
+   690→        || this.driftReleaseTimer > 2.6;
+   691→      if (shouldRelease || !wantDrift) this.aiDrift = false;
+   692→    }
+   693→    const drift = this.aiDrift && !facingWrong;
+   694→
+   695→    // while drifting, blend into-drift bias with heading correction
+   696→    let steerOut = steer;
+   697→    if (facingWrong && this.turnLock && !this.offRoad) {
+   698→      steerOut = this.turnLock;          // committed U-turn, no wrap flip-flop
+   699→    } else if (drift && k.drifting) {
+   700→      const dir = k.driftDir || 1;
+   701→      const into = clamp(-err * dir, -1, 1); // +1 = need to rotate further into the drift
+   702→      steerOut = clamp(dir * 0.4 + into * 0.8, -1, 1);
+   703→    }
+   704→
+   705→    // ---------------- item tactics ---------------------------------------------
+   706→    let fireItem = false;
+   707→    if (ctx.itemsEnabled) {
+   708→      this.itemThinkIn -= dt;
+   709→      if (this.itemThinkIn <= 0) {
+   710→        this.itemThinkIn = AI.itemThinkInterval;
+   711→        fireItem = this.decideItem(ctx);
+   712→      } else if (k.itemSlot === 'triple_dart' && this.rng() < 0.3) {
+   713→        fireItem = this.rng() < this.params.itemAggro; // fire orbiting darts piecemeal
+   714→      }
+   715→    }
+   716→
+   717→    this.dbg = {
+   718→      targetSpeed: +targetSpeed.toFixed(1), steer: +steerOut.toFixed(2), err: +err.toFixed(2),
+   719→      throttle, brake, vMaxHere: +vMaxHere.toFixed(1), follow: this.followSpeed === Infinity ? -1 : +this.followSpeed.toFixed(1),
+   720→    };
+   721→
+   722→    return {
+   723→      throttle: k.spinT > 0 ? 0 : throttle,
+   724→      brake: k.spinT > 0 ? 0 : brake,
+   725→      steer: k.spinT > 0 ? 0 : clamp(steerOut, -1, 1),
+   726→      drift,
+   727→      driftRelease: false,
+   728→      fireItem,
+   729→      itemHeld: false,
+   730→      lookBack: false,
+   731→    };
+   732→  }
+   733→
+   734→  // ============================================================ battle mode
+   735→
+   736→  /** Battle arena brain: hunt boxes when empty-handed, chase enemies when armed. */
+   737→  updateBattle(dt: number, ctx: { boxes: THREE.Vector3[]; karts: KartController[]; time: number }): KartControls {
+   738→    const k = this.kart;
+   739→    let target: THREE.Vector3 | null = null;
+   740→
+   741→    const enemies = ctx.karts.filter(o => o !== k && !o.battleKo && o.battleTeam !== k.battleTeam);
+   742→    if (k.itemSlot) {
+   743→      // hunt the nearest enemy
+   744→      let bestD = Infinity;
+   745→      for (const e of enemies) {
+   746→        const d = e.pos.distanceToSquared(k.pos);
+   747→        if (d < bestD) { bestD = d; target = e.pos; }
+   748→      }
+   749→    } else {
+   750→      // grab the nearest item box
+   751→      let bestD = Infinity;
+   752→      for (const b of ctx.boxes) {
+   753→        const d = b.distanceToSquared(k.pos);
+   754→        if (d < bestD) { bestD = d; target = b; }
+   755→      }
+   756→    }
+   757→    if (!target) target = new THREE.Vector3(0, 0, 0); // arena center
+   758→
+   759→    const desiredYaw = Math.atan2(target.x - k.pos.x, target.z - k.pos.z);
+   760→    const err = angleDelta(k.yaw, desiredYaw);
+   761→    // screen-correct steering sign (positive steer = right on screen)
+   762→    const steer = clamp(-(err * 4.0), -1, 1);
+   763→    const dist = k.pos.distanceTo(target);
+   764→    const facing = Math.abs(err) < 0.35;
+   765→
+   766→    let throttle = 1, brake = 0;
+   767→    // only brake to turn when badly misaligned at point-blank range
+   768→    if (Math.abs(err) > 1.4 && dist < 5) { throttle = 0.25; }
+   769→    if (Math.abs(err) > 2.3) { throttle = 0.5; }
+   770→
+   771→    // wander a bit so arenas don't look robotic
+   772→    const wander = Math.sin(ctx.time * 0.7 + this.wander * 9) * 0.15;
+   773→    const drift = facing && Math.abs(err) > 0.5 && Math.abs(k.speed) > 14 && this.personality !== 'defensive';
+   774→
+   775→    // fire items when roughly facing an enemy at range
+   776→    let fireItem = false;
+   777→    if (k.itemSlot) {
+   778→      this.itemThinkIn -= dt;
+   779→      if (this.itemThinkIn <= 0) {
+   780→        this.itemThinkIn = AI.itemThinkInterval;
+   781→        const offensive = ['photon_dart', 'seeker_orb', 'triple_dart', 'track_hunter', 'magnet_drone', 'storm_chip'];
+   782→        if (offensive.includes(k.itemSlot) && facing && dist < 42) fireItem = true;
+   783→        else if (!offensive.includes(k.itemSlot)) fireItem = true; // shields/boosts right away
+   784→      }
+   785→    }
+   786→
+   787→    return {
+   788→      throttle, brake,
+   789→      steer: clamp(steer + wander, -1, 1),
+   790→      drift, driftRelease: false, fireItem, itemHeld: false, lookBack: false,
+   791→    };
+   792→  }
+   793→
+   794→  /** Tactical item usage by position & personality. */
+   795→  private decideItem(ctx: AICtx): boolean {
+   796→    const k = this.kart;
+   797→    const item = k.itemSlot;
+   798→    if (!item || k.rouletteUntil > 0) return false;
+   799→    const rank = k.rank; // 1-based
+   800→    this.itemHoldTime += AI.itemThinkInterval;
+   801→
+   802→    // ---- MK-style hold-behind: keep a blockable item trailing behind as a
+   803→    // rear shield while an armed rival rides our bumper. Personality-driven:
+   804→    // defensive bots hold much more often than reckless ones.
+   805→    const blockable = ['photon_dart', 'seeker_orb', 'triple_dart', 'goo_trap', 'rear_mine'].includes(item);
+   806→    if (blockable) {
+   807→      let armedTailgater = false;
+   808→      for (const other of ctx.karts) {
+   809→        if (other === k || other.battleKo || other.finished) continue;
+   810→        if (!other.itemSlot) continue;
+   811→        if (!['photon_dart', 'seeker_orb', 'triple_dart', 'track_hunter', 'magnet_drone', 'storm_chip'].includes(other.itemSlot)) continue;
+   812→        const dBehind = Spline.wrapS(k.progressS - other.progressS) * ctx.spline.length;
+   813→        if (dBehind > 0 && dBehind < 12) { armedTailgater = true; break; }
+   814→      }
+   815→      if (armedTailgater && this.rng() < this.params.holdShield + 0.35) {
+   816→        k.itemHeldOut = true;    // shield up — blocks their rear shots
+   817→        return false;            // keep holding while the threat sits there
+   818→      }
+   819→      if (k.itemHeldOut) k.itemHeldOut = false;   // threat gone → free to fire
+   820→    }
+   821→
+   822→    switch (item) {
+   823→      case 'orbit_shield':
+   824→      case 'aegis_star': {
+   825→        // DEFENSIVE SKILL: pop the shield when an armed rival is glued to
+   826→        // our bumper — not on a timer
+   827→        let armedTailgater = false;
+   828→        for (const other of ctx.karts) {
+   829→          if (other === k || other.battleKo || other.finished) continue;
+   830→          if (!other.itemSlot) continue;
+   831→          if (!['photon_dart', 'seeker_orb', 'triple_dart', 'track_hunter', 'magnet_drone', 'storm_chip'].includes(other.itemSlot)) continue;
+   832→          const dBehind = Spline.wrapS(k.progressS - other.progressS) * ctx.spline.length;
+   833→          if (dBehind > 0 && dBehind < 10) { armedTailgater = true; break; }
+   834→        }
+   835→        if (armedTailgater || rank <= 4 || this.itemHoldTime > 6) {
+   836→          this.itemHoldTime = 0;
+   837→          return this.rng() > this.params.holdShield * 0.4;
+   838→        }
+   839→        return false;
+   840→      }
+   841→      case 'goo_trap':
+   842→      case 'rear_mine':
+   843→        // traps: drop OFF the racing line only (|lat| > 45% of width) so the
+   844→        // pack behind doesn't chain-spin on them; leading comfortably or
+   845→        // someone glued behind
+   846→        const myLat = k.ginfo?.lateral ?? 0;
+   847→        const hwHere = ctx.spline.samples[Math.max(0, k.ginfo?.mainIdx ?? 0)]?.halfWidth ?? 8;
+   848→        const offLine = Math.abs(myLat) > hwHere * 0.45;
+   849→        if ((rank <= 4 || this.rng() < 0.4) && offLine) { this.itemHoldTime = 0; return true; }
+   850→        return false;
+   851→      case 'turbo_cell':
+   852→      case 'turbo_stack':
+   853→      case 'star_core': {
+   854→        // boosts: burn IMMEDIATELY to re-pace after a spin (lost time is
+   855→        // bought back on the straights). Otherwise a skilled driver saves
+   856→        // it for a STRAIGHT — the profile opening up ahead is the tell.
+   857→        const N = ctx.spline.samples.length;
+   858→        const myIdx = ((k.ginfo?.mainIdx ?? 0) % N + N) % N;
+   859→        const vFar = ctx.line.vMax[(myIdx + Math.round(N * 0.05)) % N] ?? 0;
+   860→        const straightAhead = vFar > k.baseVmax * 0.9;
+   861→        if (this.spinRecover > 0.25 || straightAhead
+   862→          || Math.abs(k.speed) > k.baseVmax * 0.75 || this.itemHoldTime > 5) {
+   863→          this.itemHoldTime = 0;
+   864→          return true;
+   865→        }
+   866→        return false;
+   867→      }
+   868→      case 'storm_chip':
+   869→        return rank >= 9;
+   870→      case 'track_hunter':
+   871→      case 'magnet_drone':
+   872→        // hunters seek the leader — fire when genuinely behind (rank or gap)
+   873→        return (rank >= 4 && this.rng() < this.params.itemAggro * 0.6) || rank >= 9;
+   874→      case 'photon_dart':
+   875→      case 'seeker_orb':
+   876→      case 'triple_dart': {
+   877→        // Single-player item war: AI projectiles target THE PLAYER only.
+   878→        // Mutual 11-way AI spam carpet-bombed the pack into permanent
+   879→        // spin-storm pileups; keeping the threat pointed at the human keeps
+   880→        // the race alive AND the item game real for them.
+   881→        // SKILL (v2): only fire on a makeable shot — roughly aligned lanes
+   882→        // or point-blank — and commit faster. Wasted shots are amateur play.
+   883→        let shotOn = false;
+   884→        const myLat = k.ginfo?.lateral ?? 0;
+   885→        for (const other of ctx.karts) {
+   886→          if (!other.isPlayer || other.battleKo || other.finished) continue;
+   887→          const dS = Spline.wrapS(other.progressS - k.progressS) * ctx.spline.length;
+   888→          if (dS > 3 && dS < 30) {
+   889→            const oLat = other.ginfo?.lateral ?? 0;
+   890→            if (Math.abs(oLat - myLat) < 4 || dS < 11) { shotOn = true; break; }
+   891→          }
+   892→        }
+   893→        const ok = shotOn && this.rng() < this.params.itemAggro
+   894→          && this.itemHoldTime > 1.2;
+   895→        if (ok) this.itemHoldTime = 0;
+   896→        return ok;
+   897→      }
+   898→      default:
+   899→        return false;
+   900→    }
+   901→  }
+   902→}
+   903→

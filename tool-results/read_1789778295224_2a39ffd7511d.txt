@@ -1,0 +1,2002 @@
+     1→/**
+     2→ * APEX KART — Track construction & runtime world.
+     3→ * Turns a TrackDef into meshes + a queryable world model:
+     4→ *  - textured road ribbon (asphalt grain, lane paint) with banking + jump gaps
+     5→ *  - diagonal kerbs, wide terrain skirt + outer apron (no more void beside road)
+     6→ *  - guardrails on both edges (visual + physical wallConstrain), opened at
+     7→ *    shortcut branches and jump gaps
+     8→ *  - arched tunnels with portals, ribs and ceiling lights
+     9→ *  - shortcuts (OpenPath branches with mapped progress)
+    10→ *  - boost pads, item boxes (respawning), hazards (mover/faller/zone/gate)
+    11→ *  - finish arch + checker start line + start grid + minimap polyline
+    12→ *  - precomputed AI racing line (apex-cutting lateral + speed profile)
+    13→ * The TrackWorld.groundQuery() is the single source of truth for physics.
+    14→ */
+    15→
+    16→import * as THREE from 'three';
+    17→import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+    18→import { HazardDef, TrackDef } from '../core/Types';
+    19→import { makeRng, wrapAngle } from '../core/MathUtils';
+    20→import { OpenPath, Projection, Spline } from './Spline';
+    21→import { buildCrowd, buildProp, buildSky, mat, PropKind, THEMES, ThemeStyle } from './Decorations';
+    22→import { ITEMS, PHYS } from '../core/Config';
+    23→import { billboardTexture, checkerTexture, chevronTexture, groundTexture, kerbTexture, railTexture, roadPhotoTexture, roadTexture, tunnelTexture } from './Textures';
+    24→
+    25→export const SAMPLE_COUNT = 320;
+    26→
+    27→export interface GroundInfo {
+    28→  height: number; hasGround: boolean; onRoad: boolean; roughness: number;
+    29→  s: number; lateral: number; onShortcut: number; mainIdx: number; pathIdx: number;
+    30→  onJump: boolean; ptIdx: number;
+    31→  /** exact road slope (tangent.y) — fuels launches & crest physics */
+    32→  slope: number;
+    33→}
+    34→
+    35→export interface ItemBox {
+    36→  pos: THREE.Vector3; mesh: THREE.Group; active: boolean; respawnAt: number;
+    37→  /** golden boxes (every 3rd row) hand out TWO items at 150cc+ */
+    38→  golden: boolean;
+    39→}
+    40→
+    41→/** A collectible coin (MK-style speed economy). Rendered via one InstancedMesh. */
+    42→export interface CoinInstance {
+    43→  pos: THREE.Vector3;
+    44→  active: boolean;
+    45→  respawnAt: number;
+    46→  idx: number;            // index into the InstancedMesh
+    47→  s: number;              // track s (0..1) — AI coin-seeking without projection
+    48→  lat: number;            // lateral offset (m) at placement
+    49→}
+    50→
+    51→export interface HazardInstance {
+    52→  def: HazardDef;
+    53→  mesh: THREE.Object3D;
+    54→  pos: THREE.Vector3;
+    55→  radius: number;
+    56→  active: boolean;          // gates: currently solid; movers: always; fallers: near ground
+    57→  update: (t: number, dt: number) => void;
+    58→}
+    59→
+    60→export interface PadInstance { pos: THREE.Vector3; s: number; }
+    61→
+    62→/** Precomputed racing line: per-sample lateral offset & safe speed (m/s). */
+    63→export interface RacingLine {
+    64→  lat: Float32Array;
+    65→  vMax: Float32Array;
+    66→}
+    67→
+    68→interface Animatable { update: (t: number, dt: number) => void; }
+    69→
+    70→const ROAD_V_REPEAT = 11;      // meters per road texture repeat (asphalt grain)
+    71→const KERB_V_REPEAT = 1.9;     // meters per kerb stripe pair
+    72→const GROUND_V_REPEAT = 17;    // meters per terrain tile
+    73→const APRON_WIDTH = 30;        // base terrain beyond the drivable skirt
+    74→const APRON_PER_M_LIFT = 1.5;  // extra embankment width per meter of elevation
+    75→const RAIL_LATERAL = 1.35;     // rail band center beyond road edge (over the kerb)
+    76→const WALL_LIMIT = 0.45;       // kart CENTER clamp beyond road edge (wheels touch rail)
+    77→const RAMP_RUN = 20;           // meters of launch ramp baked before each gap
+    78→const RAMP_SLOPE = 0.22;       // launch ramp slope (vy = slope * speed at the lip)
+    79→
+    80→export class TrackWorld {
+    81→  readonly def: TrackDef;
+    82→  readonly style: ThemeStyle;
+    83→  readonly spline: Spline;
+    84→  readonly shortcuts: OpenPath[] = [];
+    85→  readonly group = new THREE.Group();
+    86→  readonly minimap: { x: number; z: number }[];
+    87→  readonly itemBoxes: ItemBox[] = [];
+    88→  readonly coins: CoinInstance[] = [];
+    89→  readonly pads: PadInstance[] = [];
+    90→  readonly hazards: HazardInstance[] = [];
+    91→  readonly spawnPoints: THREE.Vector3[] = [];
+    92→  readonly respawnPoints: THREE.Vector3[] = [];
+    93→  readonly animatables: Animatable[] = [];
+    94→  readonly mirror: boolean;
+    95→  readonly racingLine: RacingLine;
+    96→  /** per-side: rail disabled (jump gap / shortcut entry-exit windows) */
+    97→  readonly railOpen: { left: Uint8Array; right: Uint8Array };
+    98→  finishPos = new THREE.Vector3();
+    99→  private coinMesh: THREE.InstancedMesh | null = null;
+   100→
+   101→  constructor(def: TrackDef, mirror: boolean, decorScale: number, crowdScale: number) {
+   102→    this.def = def;
+   103→    this.mirror = mirror;
+   104→    const style = { ...THEMES[def.theme] };
+   105→    this.style = style;
+   106→    this.minimap = [];
+   107→
+   108→    // Mirror = flip X of every control point before spline sampling.
+   109→    const ctrl = mirror
+   110→      ? def.points.map(p => ({ ...p, x: -p.x }))
+   111→      : def.points;
+   112→    this.spline = new Spline(ctrl, SAMPLE_COUNT, def.halfWidth);
+   113→    this.applyJumpRamps();
+   114→    this.minimap = this.spline.minimapPolyline();
+   115→
+   116→    // shortcut spans must be known before rails (they open holes in them)
+   117→    const spans = this.computeShortcutSpans();
+   118→    this.railOpen = this.computeRailOpen(spans);
+   119→
+   120→    this.buildRoad();
+   121→    this.buildShortcuts(spans);
+   122→    this.buildRails();
+   123→    this.buildTunnels();
+   124→    this.buildPads();
+   125→    this.buildItemBoxes();
+   126→    this.buildCoins();
+   127→    this.buildFinishArch();
+   128→    this.buildHazards();
+   129→    this.buildSpawns();
+   130→    this.buildDecorations(decorScale, crowdScale);
+   131→    this.buildEdgeDressing(decorScale);
+   132→    this.buildBunting();
+   133→    this.racingLine = this.computeRacingLine();
+   134→  }
+   135→
+   136→  // ------------------------------------------------------------ jump ramps
+   137→
+   138→  /**
+   139→   * Bake launch lips before jump gaps: a constant ~0.22 slope over ~20 m,
+   140→   * so karts arrive at the gap already rising. KartController converts that
+   141→   * slope into vertical velocity at takeoff — gaps are flown, not fallen
+   142→   * into. A slightly deeper landing (authored in the catalog) extends the
+   143→   * flight for free.
+   144→   */
+   145→  private applyJumpRamps(): void {
+   146→    const sp = this.spline;
+   147→    const N = sp.samples.length;
+   148→    let i = 0;
+   149→    while (i < N) {
+   150→      if (!sp.samples[i].jump) { i++; continue; }
+   151→      // found a jump run: find its start
+   152→      let start = i;
+   153→      while (start > 0 && sp.samples[start - 1].jump) start--;
+   154→      // walk back from the gap edge, lifting on a linear slope
+   155→      let back = 0;
+   156→      for (let k = 1; k <= 12; k++) {
+   157→        const idx = ((start - k) % N + N) % N;
+   158→        if (sp.samples[idx].jump) break; // wrapped into another run
+   159→        back += sp.samples[(idx + 1) % N].pos.distanceTo(sp.samples[idx].pos);
+   160→        if (back > RAMP_RUN) break;
+   161→        sp.samples[idx].pos.y += RAMP_SLOPE * (RAMP_RUN - back);
+   162→        // FUNNEL: neck the road down to 78% of its width toward the lip —
+   163→        // karts channel toward the center (too tight a neck shoved 12-kart
+   164→        // packs off the road at the lip; 78% funnels without pileups)
+   165→        const neck = 0.78 + 0.22 * Math.min(1, back / RAMP_RUN);
+   166→        sp.samples[idx].halfWidth *= neck;
+   167→      }
+   168→      // skip the whole run
+   169→      while (i < N && sp.samples[i].jump) i++;
+   170→      // widen the landing zone: +5 m of halfWidth fading over ~14 samples
+   171→      // after the gap, so slightly-wide flights still land on the road
+   172→      for (let k = 0; k < 14; k++) {
+   173→        const idx = i + k;
+   174→        if (idx >= N) break;
+   175→        if (sp.samples[idx].jump) continue;
+   176→        sp.samples[idx].halfWidth += 5 * (1 - k / 14);
+   177→      }
+   178→    }
+   179→
+   180→    // The ramp lifts moved sample POSITIONS — recompute tangents & rights
+   181→    // from the lifted geometry so GroundInfo.slope reports the real ramp
+   182→    // slope (0.22), which is what converts speed into launch velocity.
+   183→    for (let i2 = 0; i2 < N; i2++) {
+   184→      const a = sp.samples[(i2 - 1 + N) % N].pos;
+   185→      const b = sp.samples[(i2 + 1) % N].pos;
+   186→      sp.samples[i2].tangent.set(b.x - a.x, b.y - a.y, b.z - a.z).normalize();
+   187→      sp.samples[i2].right.set(
+   188→        sp.samples[i2].tangent.z, 0, -sp.samples[i2].tangent.x).normalize();
+   189→    }
+   190→  }
+   191→
+   192→  // ------------------------------------------------------------ road mesh
+   193→
+   194→  private vertexAt(smIdx: number, lateral: number, yOff = 0): THREE.Vector3 {
+   195→    const sm = this.spline.samples[smIdx];
+   196→    return new THREE.Vector3(
+   197→      sm.pos.x + sm.right.x * lateral,
+   198→      sm.pos.y + sm.right.y * lateral + lateral * Math.sin(sm.bank) + yOff,
+   199→      sm.pos.z + sm.right.z * lateral,
+   200→    );
+   201→  }
+   202→
+   203→  /**
+   204→   * Road + kerbs + drivable skirt + visual apron + start line.
+   205→   * One merged geometry per material (road / kerb / terrain / apron).
+   206→   */
+   207→  private buildRoad(): void {
+   208→    const sp = this.spline;
+   209→    const N = sp.samples.length;
+   210→    const style = this.style;
+   211→    const theme = this.def.theme;
+   212→    const rainbow = !!style.rainbowRoad;
+   213→
+   214→    // ---- accumulators per material ------------------------------------
+   215→    const mk = (): { pos: number[]; uv: number[]; idx: number[] } => ({ pos: [], uv: [], idx: [] });
+   216→    const road = mk(), markings = mk(), kerb = mk(), ground = mk(), apron = mk(), rainbowAcc = mk(), verge = mk();
+   217→
+   218→    // verge shoulder tint — the band between kerb and terrain reads as a
+   219→    // maintained shoulder instead of "empty grass right next to the road"
+   220→    const VERGE_TINT: Record<string, number> = {
+   221→      meadow: 0x8fa860, desert: 0xcbb27c, beach: 0xd8cc9a, city: 0x55565e,
+   222→      snow: 0xdfe8f2, volcano: 0x57453c, castle: 0x93a878, space: 0x444a5e,
+   223→      jungle: 0x6d9a4e, factory: 0x6e7076, glacier: 0xcfe0ec, prism: 0xffffff,
+   224→    };
+   225→
+   226→    const distOf = (i: number): number => (i === N ? sp.length : sp.samples[i % N].dist);
+   227→
+   228→    const pushStrip = (
+   229→      acc: { pos: number[]; uv: number[]; idx: number[] },
+   230→      i: number, lat0: number, lat1: number, yOff0: number, yOff1: number,
+   231→      vRep: number, uRepeat = 1, vOffset = 0,
+   232→    ): void => {
+   233→      const j = (i + 1) % N;
+   234→      const base = acc.pos.length / 3;
+   235→      const a = this.vertexAt(i, lat0, yOff0);
+   236→      const b = this.vertexAt(i, lat1, yOff1);
+   237→      const c = this.vertexAt(j, lat1, yOff1);
+   238→      const d = this.vertexAt(j, lat0, yOff0);
+   239→      const v0 = distOf(i) / vRep + vOffset;
+   240→      const v1 = distOf(i + 1) / vRep + vOffset;
+   241→      acc.pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z);
+   242→      acc.uv.push(0, v0, uRepeat, v0, uRepeat, v1, 0, v1);
+   243→      // winding: with `right` pointing to the track's LEFT (up x tangent
+   244→      // convention), lat0 sits on the TRUE right — so (a,b,c) as pushed is
+   245→      // clockwise seen from above and gets backface-culled. Reversed index
+   246→      // order makes every strip face UP. This was the invisible-road bug.
+   247→      // (Mirror mode too: the spline RECOMPUTES right from the mirrored
+   248→      // tangent, so a mirrored strip is the reflection of the SWAPPED-vertex
+   249→      // triangle (b,a,d) — which faces up — meaning both orientations need
+   250→      // this same reversed order. Verified by probe: n0=(0,1,0) on both.)
+   251→      acc.idx.push(base, base + 2, base + 1, base, base + 3, base + 2);
+   252→    };
+   253→
+   254→    const skirt = style.skirt;
+   255→
+   256→    // auto-embankment baseline: outer terrain falls to the background plane
+   257→    // so elevated sections read as hillsides, not floating ribbons
+   258→    let minY = Infinity;
+   259→    for (const sm of sp.samples) minY = Math.min(minY, sm.pos.y);
+   260→    const planeY = minY - 2.5;
+   261→
+   262→    // variable-width outer apron (trapezoid per segment — widths follow the
+   263→    // local elevation, so each side stays watertight with its neighbors)
+   264→    const apronQuad = (i: number, side: 1 | -1): void => {
+   265→      const j = (i + 1) % N;
+   266→      const si = sp.samples[i], sj = sp.samples[j];
+   267→      const innerI = side * (si.halfWidth + 0.9 + skirt);
+   268→      const innerJ = side * (sj.halfWidth + 0.9 + skirt);
+   269→      const outerI = side * (Math.abs(innerI) + APRON_WIDTH
+   270→        + Math.max(0, si.pos.y - minY) * APRON_PER_M_LIFT);
+   271→      const outerJ = side * (Math.abs(innerJ) + APRON_WIDTH
+   272→        + Math.max(0, sj.pos.y - minY) * APRON_PER_M_LIFT);
+   273→      // order corners by increasing lateral so winding matches pushStrip
+   274→      const loI = Math.min(innerI, outerI), hiI = Math.max(innerI, outerI);
+   275→      const loJ = Math.min(innerJ, outerJ), hiJ = Math.max(innerJ, outerJ);
+   276→      const yLoI = loI === innerI ? -0.45 : planeY - si.pos.y;
+   277→      const yHiI = hiI === innerI ? -0.45 : planeY - si.pos.y;
+   278→      const yLoJ = loJ === innerJ ? -0.45 : planeY - sj.pos.y;
+   279→      const yHiJ = hiJ === innerJ ? -0.45 : planeY - sj.pos.y;
+   280→      const a = this.vertexAt(i, loI, yLoI);
+   281→      const b = this.vertexAt(i, hiI, yHiI);
+   282→      const c = this.vertexAt(j, hiJ, yHiJ);
+   283→      const d = this.vertexAt(j, loJ, yLoJ);
+   284→      const base = apron.pos.length / 3;
+   285→      const v0 = distOf(i) / (GROUND_V_REPEAT * 2.4);
+   286→      const v1 = distOf(i + 1) / (GROUND_V_REPEAT * 2.4);
+   287→      apron.pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z);
+   288→      apron.uv.push(0, v0, 1.7, v0, 1.7, v1, 0, v1);
+   289→      // winding — see pushStrip note (faces UP, both orientations)
+   290→      apron.idx.push(base, base + 2, base + 1, base, base + 3, base + 2);
+   291→    };
+   292→
+   293→    for (let i = 0; i < N; i++) {
+   294→      const sm = sp.samples[i];
+   295→      const nx = sp.samples[(i + 1) % N];
+   296→      if (sm.jump || nx.jump) continue; // gap!
+   297→
+   298→      // ---- main tarmac (photo base, or rainbow vertex colors) ---------
+   299→      if (rainbow) {
+   300→        pushStrip(rainbowAcc, i, -sm.halfWidth, sm.halfWidth, 0, 0, ROAD_V_REPEAT);
+   301→      } else {
+   302→        // photo grain tiles 2-3× across the WIDTH so it reads at distance;
+   303→        // painted markings ride on their own transparent overlay above
+   304→        const uRep = Math.max(2, Math.round(sm.halfWidth / 5.5));
+   305→        pushStrip(road, i, -sm.halfWidth, sm.halfWidth, 0, 0, ROAD_V_REPEAT, uRep);
+   306→        pushStrip(markings, i, -sm.halfWidth, sm.halfWidth, 0.012, 0.012, ROAD_V_REPEAT, 1);
+   307→      }
+   308→
+   309→      // ---- kerbs --------------------------------------------------------
+   310→      pushStrip(kerb, i, sm.halfWidth, sm.halfWidth + 0.9, 0.02, 0.02, KERB_V_REPEAT);
+   311→      pushStrip(kerb, i, -sm.halfWidth - 0.9, -sm.halfWidth, 0.02, 0.02, KERB_V_REPEAT);
+   312→
+   313→      // ---- verge band + drivable terrain skirt ----------------------------
+   314→      if (skirt > 3) {
+   315→        // tinted 2.5 m shoulder right past the kerb (its own material →
+   316→        // the road edge reads as dressed instead of dropping into grass)
+   317→        const vEnd = sm.halfWidth + 3.4;
+   318→        pushStrip(verge, i, sm.halfWidth + 0.9, vEnd, -0.06, -0.16, GROUND_V_REPEAT, 0.42);
+   319→        pushStrip(verge, i, -vEnd, -(sm.halfWidth + 0.9), -0.16, -0.06, GROUND_V_REPEAT, 0.42);
+   320→        // terrain continues from the verge outwards
+   321→        pushStrip(ground, i, vEnd, sm.halfWidth + 0.9 + skirt, -0.16, -0.45, GROUND_V_REPEAT, (skirt - 2.5) / GROUND_V_REPEAT * 2);
+   322→        pushStrip(ground, i, -(sm.halfWidth + 0.9 + skirt), -vEnd, -0.45, -0.16, GROUND_V_REPEAT, (skirt - 2.5) / GROUND_V_REPEAT * 2);
+   323→        // visual-only outer apron sloping down to the terrain plane; widens
+   324→        // with elevation so climbs look like supported hillsides
+   325→        apronQuad(i, 1);
+   326→        apronQuad(i, -1);
+   327→      }
+   328→    }
+   329→
+   330→    const buildMesh = (
+   331→      acc: { pos: number[]; uv: number[]; idx: number[] },
+   332→      material: THREE.Material,
+   333→      colors?: number[],
+   334→    ): THREE.Mesh => {
+   335→      const geo = new THREE.BufferGeometry();
+   336→      geo.setAttribute('position', new THREE.Float32BufferAttribute(acc.pos, 3));
+   337→      geo.setAttribute('uv', new THREE.Float32BufferAttribute(acc.uv, 2));
+   338→      if (colors) geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+   339→      geo.setIndex(acc.idx);
+   340→      geo.computeVertexNormals();
+   341→      const mesh = new THREE.Mesh(geo, material);
+   342→      mesh.receiveShadow = true;
+   343→      return mesh;
+   344→    };
+   345→
+   346→    if (road.pos.length) {
+   347→      const m = new THREE.MeshLambertMaterial({ map: roadPhotoTexture(theme) });
+   348→      this.group.add(buildMesh(road, m));
+   349→    }
+   350→    if (markings.pos.length) {
+   351→      // transparent painted-line overlay just above the photo tarmac
+   352→      const m = new THREE.MeshLambertMaterial({ map: roadTexture(theme), transparent: true, depthWrite: false });
+   353→      const mesh = buildMesh(markings, m);
+   354→      mesh.renderOrder = 1;
+   355→      this.group.add(mesh);
+   356→    }
+   357→    if (rainbowAcc.pos.length) {
+   358→      // prism: per-vertex rainbow hue
+   359→      const colors: number[] = [];
+   360→      for (let i = 0; i < rainbowAcc.pos.length / 3; i++) {
+   361→        const c = new THREE.Color().setHSL((i * 0.13) % 1, 0.95, 0.72);
+   362→        colors.push(c.r, c.g, c.b);
+   363→      }
+   364→      this.group.add(buildMesh(rainbowAcc, new THREE.MeshBasicMaterial({ vertexColors: true }), colors));
+   365→    }
+   366→    if (kerb.pos.length) {
+   367→      const m = new THREE.MeshLambertMaterial({ map: kerbTexture(theme) });
+   368→      this.group.add(buildMesh(kerb, m));
+   369→    }
+   370→    if (ground.pos.length) {
+   371→      const m = new THREE.MeshLambertMaterial({ map: groundTexture(theme) });
+   372→      this.group.add(buildMesh(ground, m));
+   373→    }
+   374→    if (verge.pos.length) {
+   375→      const m = new THREE.MeshLambertMaterial({ map: groundTexture(theme), color: VERGE_TINT[theme] ?? 0xa8b08a });
+   376→      this.group.add(buildMesh(verge, m));
+   377→    }
+   378→    if (apron.pos.length) {
+   379→      const m = new THREE.MeshLambertMaterial({ map: groundTexture(theme), color: 0xb9c0c9 });
+   380→      this.group.add(buildMesh(apron, m));
+   381→    }
+   382→
+   383→    // ---- checker start line overlay --------------------------------------
+   384→    const startAcc = mk();
+   385→    for (let i = 0; i < N; i++) {
+   386→      const sm = sp.samples[i];
+   387→      const nx = sp.samples[(i + 1) % N];
+   388→      if (sm.jump || nx.jump) continue;
+   389→      if (sm.dist > 6.5) break;
+   390→      pushStrip(startAcc, i, -sm.halfWidth, sm.halfWidth, 0.045, 0.045, 3.2);
+   391→    }
+   392→    if (startAcc.pos.length) {
+   393→      const m = new THREE.MeshLambertMaterial({ map: checkerTexture() });
+   394→      this.group.add(buildMesh(startAcc, m));
+   395→    }
+   396→
+   397→    // ---- distant ground plane: world terrain to the horizon -----------------
+   398→    // Fills the gap between the road apron and the mountain backdrop so the
+   399→    // scene reads as landscape instead of a floating ribbon. Void themes
+   400→    // (space / prism) intentionally skip it.
+   401→    if (theme !== 'space' && theme !== 'prism') {
+   402→      let minY = Infinity;
+   403→      let cx = 0, cz = 0;
+   404→      for (const sm of sp.samples) {
+   405→        minY = Math.min(minY, sm.pos.y);
+   406→        cx += sm.pos.x; cz += sm.pos.z;
+   407→      }
+   408→      cx /= N; cz /= N;
+   409→      const planeTex = groundTexture(theme).clone();
+   410→      planeTex.needsUpdate = true;
+   411→      planeTex.repeat.set(80, 80);
+   412→      const plane = new THREE.Mesh(
+   413→        new THREE.CircleGeometry(640, 48),
+   414→        new THREE.MeshLambertMaterial({ map: planeTex, color: 0x8f96a3 }),
+   415→      );
+   416→      plane.rotation.x = -Math.PI / 2;
+   417→      plane.position.set(cx, minY - 2.5, cz);
+   418→      plane.receiveShadow = false;
+   419→      this.group.add(plane);
+   420→    }
+   421→  }
+   422→
+   423→  // ------------------------------------------------------------ shortcuts
+   424→
+   425→  /** Derive the from/to progress of every shortcut from its geometry. */
+   426→  private computeShortcutSpans(): { from: number; to: number; inner: THREE.Vector3[] }[] {
+   427→    const out: { from: number; to: number; inner: THREE.Vector3[] }[] = [];
+   428→    for (const sc of this.def.shortcuts) {
+   429→      if (sc.points.length < 1) continue;
+   430→      const inner = sc.points.map(p => new THREE.Vector3(this.mirror ? -p.x : p.x, p.y ?? 0, p.z));
+   431→      const from = this.nearestRoadS(inner[0]);
+   432→      const to = this.nearestRoadS(inner[inner.length - 1]);
+   433→      let span = to - from;
+   434→      if (span < 0) span += 1; // wrap across the finish line
+   435→      if (span > 0.3 || span < 0.012) continue; // sanity: not a real shortcut
+   436→      out.push({ from, to, inner });
+   437→    }
+   438→    return out;
+   439→  }
+   440→
+   441→  private buildShortcuts(spans: { from: number; to: number; inner: THREE.Vector3[] }[]): void {
+   442→    for (const span of spans) {
+   443→      const { from, to } = span;
+   444→      const entry = this.spline.sampleAt(from);
+   445→      const exit = this.spline.sampleAt(to);
+   446→      const pts = [entry.pos.clone(), ...span.inner, exit.pos.clone()];
+   447→      // handle wrap: mapped progress may exceed 1 near the finish line
+   448→      const path = new OpenPath(pts, from, to < from ? to + 1 : to, this.def.shortcuts.find(
+   449→        s => this.nearestRoadSPre(s.points[0]) === from,
+   450→      )?.rough ?? 0.75, 48);
+   451→      this.shortcuts.push(path);
+   452→
+   453→      // visual: dirt ribbon with kerb-like edge stripes
+   454→      const positions: number[] = [];
+   455→      const uvs: number[] = [];
+   456→      const indices: number[] = [];
+   457→      const halfW = 3.4;
+   458→      for (let i = 0; i < path.pts.length - 1; i++) {
+   459→        const a = path.pts[i], b = path.pts[i + 1];
+   460→        const base = positions.length / 3;
+   461→        positions.push(
+   462→          a.pos.x - a.right.x * halfW, a.pos.y + 0.04, a.pos.z - a.right.z * halfW,
+   463→          a.pos.x + a.right.x * halfW, a.pos.y + 0.04, a.pos.z + a.right.z * halfW,
+   464→          b.pos.x + b.right.x * halfW, b.pos.y + 0.04, b.pos.z + b.right.z * halfW,
+   465→          b.pos.x - b.right.x * halfW, b.pos.y + 0.04, b.pos.z - b.right.z * halfW,
+   466→        );
+   467→        const v0 = a.dist / 8, v1 = b.dist / 8;
+   468→        uvs.push(0, v0, 1, v0, 1, v1, 0, v1);
+   469→        // winding — faces UP (see pushStrip note), both orientations
+   470→        indices.push(base, base + 2, base + 1, base, base + 3, base + 2);
+   471→      }
+   472→      const geo = new THREE.BufferGeometry();
+   473→      geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+   474→      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+   475→      geo.setIndex(indices);
+   476→      geo.computeVertexNormals();
+   477→      const dirt = new THREE.MeshLambertMaterial({ map: groundTexture(this.def.theme), color: 0xb59d7a });
+   478→      const mesh = new THREE.Mesh(geo, dirt);
+   479→      mesh.receiveShadow = true;
+   480→      this.group.add(mesh);
+   481→    }
+   482→  }
+   483→
+   484→  /** Road progress of the sample nearest to a shortcut control point. */
+   485→  private nearestRoadSPre(p: { x: number; y?: number; z: number }): number {
+   486→    return this.nearestRoadS(new THREE.Vector3(this.mirror ? -p.x : p.x, p.y ?? 0, p.z));
+   487→  }
+   488→
+   489→  /** Road progress of the sample nearest to a world point. */
+   490→  private nearestRoadS(p: THREE.Vector3): number {
+   491→    let best = 0, bestD = Infinity;
+   492→    const sp = this.spline;
+   493→    for (let i = 0; i < sp.samples.length; i += 2) {
+   494→      const d = sp.samples[i].pos.distanceToSquared(p);
+   495→      if (d < bestD) { bestD = d; best = i; }
+   496→    }
+   497→    return sp.samples[best].s;
+   498→  }
+   499→
+   500→  // ------------------------------------------------------------ guardrails
+   501→
+   502→  /**
+   503→   * Per-side rail openings. Jump gaps open BOTH sides. Shortcuts open ONLY
+   504→   * the side facing the branch, ONLY in a short window around the entry and
+   505→   * the exit — the rest of the span keeps its rails, so karts that drift
+   506→   * wide mid-span can never fall off the world through a shortcut zone.
+   507→   */
+   508→  private computeRailOpen(
+   509→    spans: { from: number; to: number; inner: THREE.Vector3[] }[],
+   510→  ): { left: Uint8Array; right: Uint8Array } {
+   511→    const sp = this.spline;
+   512→    const N = sp.samples.length;
+   513→    const left = new Uint8Array(N);
+   514→    const right = new Uint8Array(N);
+   515→    for (let i = 0; i < N; i++) if (sp.samples[i].jump) { left[i] = 1; right[i] = 1; }
+   516→
+   517→    for (const span of spans) {
+   518→      const mid = span.inner[Math.floor(span.inner.length / 2)] ?? span.inner[0];
+   519→      const openAt = (s: number, which: 'from' | 'to'): void => {
+   520→        const sm = sp.sampleAt(s);
+   521→        const toward = which === 'from'
+   522→          ? span.inner[0]
+   523→          : span.inner[span.inner.length - 1];
+   524→        const ref = toward ?? mid;
+   525→        const side = Math.sign(
+   526→          (ref.x - sm.pos.x) * sm.right.x + (ref.z - sm.pos.z) * sm.right.z) >= 0 ? right : left;
+   527→        const w = 4; // samples (~±15 m) — just wide enough to slip through
+   528→        const center = Math.floor(Spline.wrapS(s) * N);
+   529→        for (let k = -w; k <= w; k++) {
+   530→          side[((center + k) % N + N) % N] = 1;
+   531→        }
+   532→      };
+   533→      openAt(span.from, 'from');
+   534→      openAt(span.to, 'to');
+   535→    }
+   536→    return { left, right };
+   537→  }
+   538→
+   539→  /** Physical + visual guardrails on both edges. */
+   540→  private buildRails(): void {
+   541→    const sp = this.spline;
+   542→    const N = sp.samples.length;
+   543→    const dark = ['city', 'space', 'volcano', 'prism'].includes(this.def.theme);
+   544→
+   545→    // posts (merged into one geometry)
+   546→    const postGeos: THREE.BufferGeometry[] = [];
+   547→    const bandPos: number[] = [], bandUv: number[] = [], bandIdx: number[] = [];
+   548→    const topPos: number[] = [], topIdx: number[] = [];
+   549→    const railLat = (i: number): number => sp.samples[i].halfWidth + RAIL_LATERAL;
+   550→
+   551→    const quad = (acc: { pos: number[]; uv?: number[]; idx: number[] }, a: THREE.Vector3, b: THREE.Vector3, c: THREE.Vector3, d: THREE.Vector3, u0 = 0, u1 = 1, v0 = 0, v1 = 1): void => {
+   552→      const base = acc.pos.length / 3;
+   553→      acc.pos.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, d.x, d.y, d.z);
+   554→      if (acc.uv) acc.uv.push(u0, v0, u1, v0, u1, v1, u0, v1);
+   555→      acc.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+   556→    };
+   557→
+   558→    for (let i = 0; i < N; i++) {
+   559→      const j = (i + 1) % N;
+   560→      const sm = sp.samples[i];
+   561→
+   562→      for (const side of [-1, 1] as const) {
+   563→        // side-aware rail gaps (jump runs open both sides; shortcut entry
+   564→        // windows open only the branch side)
+   565→        const openSide = side < 0 ? this.railOpen.left : this.railOpen.right;
+   566→        if (openSide[i] || openSide[j]) continue;
+   567→        const lat = side * railLat(i);
+   568→
+   569→        // rail band (0.52 → 0.98 above local road edge) + top tube strip
+   570→        const a0 = this.vertexAt(i, lat, 0.52);
+   571→        const a1 = this.vertexAt(i, lat, 0.98);
+   572→        const b0 = this.vertexAt(j, lat, 0.52);
+   573→        const b1 = this.vertexAt(j, lat, 0.98);
+   574→        const v0 = sm.dist / 6, v1 = (j <= i ? sp.length : sp.samples[j].dist) / 6;
+   575→        quad({ pos: bandPos, uv: bandUv, idx: bandIdx }, a0, a1, b1, b0, v0, v1, 0, 1);
+   576→
+   577→        const t0 = this.vertexAt(i, lat, 0.98);
+   578→        const t1 = this.vertexAt(i, lat, 1.12);
+   579→        const u0 = this.vertexAt(j, lat, 0.98);
+   580→        const u1 = this.vertexAt(j, lat, 1.12);
+   581→        quad({ pos: topPos, idx: topIdx }, t0, t1, u1, u0);
+   582→
+   583→        // posts every 3 samples
+   584→        if (i % 3 === 0) {
+   585→          const base = this.vertexAt(i, lat, 0);
+   586→          const g = new THREE.BoxGeometry(0.22, 1.05, 0.22);
+   587→          g.translate(base.x, base.y + 0.5, base.z);
+   588→          postGeos.push(g);
+   589→        }
+   590→      }
+   591→    }
+   592→
+   593→    if (postGeos.length) {
+   594→      const merged = mergeGeometries(postGeos);
+   595→      if (merged) {
+   596→        const m = new THREE.Mesh(merged, mat(0x3c414c));
+   597→        m.castShadow = false;
+   598→        this.group.add(m);
+   599→      }
+   600→      for (const g of postGeos) g.dispose();
+   601→    }
+   602→    if (bandIdx.length) {
+   603→      const geo = new THREE.BufferGeometry();
+   604→      geo.setAttribute('position', new THREE.Float32BufferAttribute(bandPos, 3));
+   605→      geo.setAttribute('uv', new THREE.Float32BufferAttribute(bandUv, 2));
+   606→      geo.setIndex(bandIdx);
+   607→      geo.computeVertexNormals();
+   608→      const m = new THREE.MeshLambertMaterial({ map: railTexture(), side: THREE.DoubleSide });
+   609→      this.group.add(new THREE.Mesh(geo, m));
+   610→    }
+   611→    if (topIdx.length) {
+   612→      const geo = new THREE.BufferGeometry();
+   613→      geo.setAttribute('position', new THREE.Float32BufferAttribute(topPos, 3));
+   614→      geo.setIndex(topIdx);
+   615→      geo.computeVertexNormals();
+   616→      const m = dark
+   617→        ? new THREE.MeshBasicMaterial({
+   618→          color: this.def.theme === 'prism' ? 0xff5a8a : this.def.theme === 'space' ? 0x35e0ff : this.def.theme === 'volcano' ? 0xff7a2a : 0x35e0e0,
+   619→          side: THREE.DoubleSide,
+   620→        })
+   621→        : new THREE.MeshLambertMaterial({ color: 0xc9ced8, emissive: 0x1a1c22, side: THREE.DoubleSide });
+   622→      this.group.add(new THREE.Mesh(geo, m));
+   623→    }
+   624→  }
+   625→
+   626→  /**
+   627→   * Physical rail: clamp kart inside the kerb zone unless on a jump gap,
+   628→   * inside a shortcut, or on an opened span. Grazing keeps most speed; a
+   629→   * kart grinding INTO the rail gets gently redirected along it (arcade
+   630→   * bumper-rail behavior) instead of stalling in a scrub equilibrium.
+   631→   */
+   632→  wallConstrain(kart: import('../karts/KartController').KartController): void {
+   633→    const gi = kart.ginfo;
+   634→    // Rails constrain karts NEAR road level (grounded OR hopping — a drift
+   635→    // hop must not sail over the 1.12 m rail into the void). Karts far
+   636→    // BELOW the road (void falls) fall cleanly: clamping them dragged them
+   637→    // sideways and corrupted their track progress.
+   638→    if (!gi || gi.onJump || gi.onShortcut >= 0) return;
+   639→    if (kart.pos.y - gi.height > 1.6) return;   // above rail height
+   640→    if (gi.height - kart.pos.y > 3) return;     // deep in a fall
+   641→    const idx = gi.mainIdx;
+   642→    if (idx < 0) return;
+   643→    const openSide = gi.lateral < 0 ? this.railOpen.left : this.railOpen.right;
+   644→    if (openSide[idx]) return;
+   645→    const sm = this.spline.samples[idx];
+   646→    const limit = sm.halfWidth + WALL_LIMIT;
+   647→    if (Math.abs(gi.lateral) <= limit) {
+   648→      kart.railGrindT = 0; // clean stretch — reset the grind detector
+   649→      return;
+   650→    }
+   651→
+   652→    const sign = Math.sign(gi.lateral);
+   653→    // LATERAL-ONLY clamp: remove exactly the outward overshoot along the
+   654→    // sample's right vector — NEVER the along-track motion. The old version
+   655→    // teleported the kart to the rail point of its projected sample, which
+   656→    // also cancelled the FORWARD component of every step; the kart then
+   657→    // re-projected to the same sample, got teleported to the same point,
+   658→    // and sat in a perfect fixed-point attractor (frozen position, 4.5 m/s
+   659→    // wheelspin, minutes on end). Grazing karts now keep their speed and
+   660→    // SLIDE along the rail; only the outward escape is blocked.
+   661→    const overshoot = Math.abs(gi.lateral) - limit;
+   662→    if (overshoot > 1e-4) {
+   663→      const pull = Math.min(overshoot, 1.5); // ≤ 1.5 m per frame, never a teleport
+   664→      kart.pos.x -= sm.right.x * sign * pull;
+   665→      kart.pos.z -= sm.right.z * sign * pull;
+   666→      // spring BACK into the road a touch (restitution) — a hard hit throws
+   667→      // the kart off the wall instead of gluing it to the rail
+   668→      const back = Math.min(0.25 * pull, 0.3);
+   669→      kart.pos.x -= sm.right.x * sign * back;
+   670→      kart.pos.z -= sm.right.z * sign * back;
+   671→    }
+   672→
+   673→    // RAIL-GRIND TIMER (detection only — the AI rescues itself): the clamp
+   674→    // above can cancel a kart's motion every frame, leaving it in a perfect
+   675→    // wheelspin equilibrium against the rail. The wall used to fight back
+   676→    // by overriding yaw — that overpowered the driver's steering and froze
+   677→    // karts for minutes. Now it just measures; AIDriver reads railGrindT
+   678→    // and re-aims deep into the road to peel off the wall.
+   679→    kart.railGrindT += 1 / 60;
+   680→    const tanYaw = Math.atan2(sm.tangent.x, sm.tangent.z);
+   681→
+   682→    // proportional scrub: head-on into the rail loses ~40%, grazing ~nothing
+   683→    const fwd = kart.forward();
+   684→    const out = Math.max(0, fwd.x * sm.right.x * sign + fwd.z * sm.right.z * sign);
+   685→    if (out > 0) kart.speed *= 1 - out * 0.4;
+   686→    // impact intensity for FX (sparks + camera kick) — anything above a
+   687→    // shallow graze counts; deep hits (head-on at speed) scale to 1
+   688→    if (out > 0.18 && Math.abs(kart.speed) > 7) {
+   689→      kart.wallHit = Math.max(kart.wallHit, Math.min(1, out * Math.abs(kart.speed) / 16));
+   690→      kart.slip *= 0.6;
+   691→    }
+   692→    // redirect grinding karts along the rail so they never stall against it
+   693→    if (out > 0.25 && Math.abs(kart.speed) > 2) {
+   694→      const delta = wrapAngle(tanYaw - kart.yaw);
+   695→      kart.yaw += delta * 0.14;
+   696→      kart.slip *= 0.5;
+   697→    }
+   698→  }
+   699→
+   700→  // ------------------------------------------------------------ tunnels
+   701→
+   702→  /** Arched tunnel over every `tunnel` run: tube + portals + ribs + lights. */
+   703→  private buildTunnels(): void {
+   704→    const sp = this.spline;
+   705→    const N = sp.samples.length;
+   706→    const runs: { start: number; end: number }[] = [];
+   707→
+   708→    // collect wrap-aware runs of consecutive tunnel samples
+   709→    let any = false;
+   710→    for (let i = 0; i < N; i++) if (sp.samples[i].tunnel) { any = true; break; }
+   711→    if (!any) return;
+   712→
+   713→    // find run starts: tunnel sample whose predecessor is not tunnel
+   714→    for (let i = 0; i < N; i++) {
+   715→      if (!sp.samples[i].tunnel) continue;
+   716→      if (!sp.samples[(i - 1 + N) % N].tunnel) {
+   717→        // walk to the end of the run
+   718→        let end = i;
+   719→        while (sp.samples[(end + 1) % N].tunnel && end < i + N) end = (end + 1) % N;
+   720→        runs.push({ start: i, end });
+   721→      }
+   722→    }
+   723→
+   724→    const wallMat = new THREE.MeshLambertMaterial({ map: tunnelTexture(this.def.theme), side: THREE.DoubleSide });
+   725→    const lightMat = new THREE.MeshBasicMaterial({ color: 0xfff2c8 });
+   726→    const ribMat = mat(0x2e323c);
+   727→
+   728→    // arch profile (lateral, height above road center)
+   729→    const profile = (hw: number): { lat: number; y: number }[] => [
+   730→      { lat: -(hw + 3.0), y: -0.4 },
+   731→      { lat: -(hw + 3.0), y: 2.8 },
+   732→      { lat: -(hw + 1.7), y: 4.6 },
+   733→      { lat: -(hw * 0.45), y: 5.9 },
+   734→      { lat: 0, y: 6.5 },
+   735→      { lat: hw * 0.45, y: 5.9 },
+   736→      { lat: hw + 1.7, y: 4.6 },
+   737→      { lat: hw + 3.0, y: 2.8 },
+   738→      { lat: hw + 3.0, y: -0.4 },
+   739→    ];
+   740→
+   741→    for (const run of runs) {
+   742→      const pos: number[] = [], uv: number[] = [], idx: number[] = [];
+   743→      const len = (run.end - run.start + N) % N;
+   744→      // include one solid sample before/after for a clean junction
+   745→      for (let k = 0; k <= len + 1; k++) {
+   746→        const i = (run.start + k) % N;
+   747→        const j = (i + 1) % N;
+   748→        const prof = profile(sp.samples[i].halfWidth);
+   749→        const profN = profile(sp.samples[j].halfWidth);
+   750→        const base = pos.length / 3;
+   751→        for (let p = 0; p < prof.length; p++) {
+   752→          const a = this.vertexAt(i, prof[p].lat, prof[p].y);
+   753→          const b = this.vertexAt(j, profN[p].lat, profN[p].y);
+   754→          pos.push(a.x, a.y, a.z);
+   755→          uv.push(p / (prof.length - 1) * 3, sp.samples[i].dist / 9);
+   756→          pos.push(b.x, b.y, b.z);
+   757→          uv.push(p / (prof.length - 1) * 3, (j <= i ? sp.length : sp.samples[j].dist) / 9);
+   758→        }
+   759→        for (let p = 0; p < prof.length - 1; p++) {
+   760→          const v0 = base + p * 2, v1 = base + p * 2 + 1;
+   761→          const v2 = base + (p + 1) * 2, v3 = base + (p + 1) * 2 + 1;
+   762→          idx.push(v0, v1, v2, v1, v3, v2);
+   763→        }
+   764→      }
+   765→      const geo = new THREE.BufferGeometry();
+   766→      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+   767→      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+   768→      geo.setIndex(idx);
+   769→      geo.computeVertexNormals();
+   770→      this.group.add(new THREE.Mesh(geo, wallMat));
+   771→
+   772→      // portals (entrance + exit facades)
+   773→      for (const at of [run.start, (run.end + 1) % N]) {
+   774→        const sm = sp.sampleAt(sp.samples[at].s);
+   775→        const portal = new THREE.Group();
+   776→        for (const side of [-1, 1]) {
+   777→          const pillar = new THREE.Mesh(new THREE.BoxGeometry(1.4, 7.4, 1.4), ribMat);
+   778→          pillar.position.copy(sm.pos).addScaledVector(sm.right, side * (sm.halfWidth + 2.6));
+   779→          pillar.position.y += 3.3;
+   780→          portal.add(pillar);
+   781→        }
+   782→        const beam = new THREE.Mesh(
+   783→          new THREE.BoxGeometry((sm.halfWidth + 3.4) * 2, 1.6, 1.4), ribMat);
+   784→        beam.position.copy(sm.pos).add(new THREE.Vector3(0, 6.6, 0));
+   785→        beam.rotation.y = -Math.atan2(sm.tangent.z, sm.tangent.x) + Math.PI / 2;
+   786→        portal.add(beam);
+   787→        this.group.add(portal);
+   788→      }
+   789→
+   790→      // ribs every 6 samples + ceiling light strips every 4 samples
+   791→      for (let k = 0; k <= len; k++) {
+   792→        const i = (run.start + k) % N;
+   793→        const sm = sp.samples[i];
+   794→        if (k % 6 === 0) {
+   795→          for (const side of [-1, 1]) {
+   796→            const pillar = new THREE.Mesh(new THREE.BoxGeometry(0.5, 4.6, 0.5), ribMat);
+   797→            pillar.position.copy(this.vertexAt(i, side * (sm.halfWidth + 2.2), 2.1));
+   798→            this.group.add(pillar);
+   799→          }
+   800→        }
+   801→        if (k % 4 === 2) {
+   802→          const light = new THREE.Mesh(new THREE.PlaneGeometry(1.1, 2.4), lightMat);
+   803→          light.rotation.x = Math.PI / 2; // face down
+   804→          light.rotation.z = -Math.atan2(sm.tangent.z, sm.tangent.x) + Math.PI / 2;
+   805→          light.position.copy(this.vertexAt(i, 0, 6.15));
+   806→          this.group.add(light);
+   807→        }
+   808→      }
+   809→    }
+   810→  }
+   811→
+   812→  // ------------------------------------------------------------ boost pads
+   813→
+   814→  private buildPads(): void {
+   815→    const padTex = makeChevronTexture(this.style.pad);
+   816→    for (const p of this.def.boostPads) {
+   817→      const sm = this.spline.sampleAt(this.mirror ? 1 - p : p);
+   818→      const geo = new THREE.PlaneGeometry(sm.halfWidth * 1.7, 4.2);
+   819→      const m = new THREE.MeshBasicMaterial({ map: padTex, transparent: true });
+   820→      const mesh = new THREE.Mesh(geo, m);
+   821→      mesh.position.copy(sm.pos).add(new THREE.Vector3(0, 0.07, 0));
+   822→      mesh.rotation.set(-Math.PI / 2, 0, 0);
+   823→      mesh.rotateZ(-Math.atan2(sm.tangent.z, sm.tangent.x) + Math.PI / 2);
+   824→      this.group.add(mesh);
+   825→      this.pads.push({ pos: mesh.position.clone(), s: p });
+   826→      this.animatables.push({
+   827→        update: (t) => { padTex.offset.y = -t * 1.6; },
+   828→      });
+   829→    }
+   830→  }
+   831→
+   832→  // ------------------------------------------------------------ item boxes
+   833→
+   834→  private buildItemBoxes(): void {
+   835→    const rng = makeRng(1337);
+   836→    const count = ITEMS.boxesPerTrack;
+   837→    for (let i = 0; i < count; i++) {
+   838→      // start the first row after the first corner (i+2), not on the grid
+   839→      const s = (((i + 2) % count) + 0.5) / count;
+   840→      const sm = this.spline.sampleAt(s);
+   841→      const lateral = (rng() * 2 - 1) * Math.max(1, sm.halfWidth - 2.4);
+   842→      const pos = this.spline.roadPoint(s, lateral).add(new THREE.Vector3(0, ITEMS.boxFloatHeight, 0));
+   843→      const golden = i % 3 === 1;                 // MK8D-style double item boxes
+   844→      const mesh = makeItemBoxMesh(golden);
+   845→      mesh.position.copy(pos);
+   846→      this.group.add(mesh);
+   847→      this.itemBoxes.push({ pos, mesh, active: true, respawnAt: 0, golden });
+   848→      this.animatables.push({
+   849→        update: (t) => {
+   850→          mesh.rotation.y = t * 1.4; mesh.rotation.x = t * 0.9;
+   851→          mesh.position.y = pos.y + Math.sin(t * 2 + i) * 0.22;
+   852→          if (!this.itemBoxes[i].active && performance.now() >= this.itemBoxes[i].respawnAt) {
+   853→            this.itemBoxes[i].active = true;
+   854→            mesh.visible = true;
+   855→          }
+   856→        },
+   857→      });
+   858→    }
+   859→  }
+   860→
+   861→  // ------------------------------------------------------------ coins
+   862→
+   863→  /**
+   864→   * MK-style coin economy: rows of 3 coins spread over the lap (center line
+   865→   * plus both flanks). One InstancedMesh keeps it at a single draw call;
+   866→   * consumed coins hide via zero-scale and respawn after PHYS.coinRespawnMs.
+   867→   */
+   868→  private buildCoins(): void {
+   869→    const rows = PHYS.coinRows;
+   870→    const perRow = 3;
+   871→    const count = rows * perRow;
+   872→
+   873→    const geo = new THREE.CylinderGeometry(0.42, 0.42, 0.09, 14);
+   874→    geo.rotateX(Math.PI / 2);   // stand the disc up facing down the road
+   875→    const goldMat = new THREE.MeshLambertMaterial({
+   876→      color: 0xffc83a, emissive: 0x5a3c00,
+   877→    });
+   878→    const inst = new THREE.InstancedMesh(geo, goldMat, count);
+   879→    inst.castShadow = false;
+   880→    inst.frustumCulled = false;
+   881→    this.group.add(inst);
+   882→    this.coinMesh = inst;
+   883→
+   884→    const dummy = new THREE.Object3D();
+   885→    let n = 0;
+   886→    for (let r = 0; r < rows; r++) {
+   887→      // start past the grid; rows spread over the remaining lap
+   888→      const s = (0.035 + (r / rows) * 0.93) % 1;
+   889→      const sm = this.spline.sampleAt(s);
+   890→      const latBase = Math.max(1.2, (sm.halfWidth - 2.2) * 0.55);
+   891→      for (let k = 0; k < perRow; k++) {
+   892→        const lateral = (k - 1) * latBase;   // -1 / 0 / +1 flanks
+   893→        const pos = this.spline.roadPoint(s, lateral).add(new THREE.Vector3(0, 0.75, 0));
+   894→        const coin: CoinInstance = { pos, active: true, respawnAt: 0, idx: n, s, lat: lateral };
+   895→        this.coins.push(coin);
+   896→        this.writeCoinMatrix(dummy, coin, 0);
+   897→        n++;
+   898→      }
+   899→    }
+   900→    inst.instanceMatrix.needsUpdate = true;
+   901→
+   902→    // shared spin — the classic MK coin twirl
+   903→    this.animatables.push({
+   904→      update: (t) => {
+   905→        const spin = t * 3.4;
+   906→        const now = performance.now();
+   907→        let dirty = false;
+   908→        for (const c of this.coins) {
+   909→          if (!c.active && now >= c.respawnAt) {
+   910→            c.active = true;
+   911→            dirty = true;
+   912→          }
+   913→        }
+   914→        if (dirty || true) {  // spin requires a matrix write each frame anyway
+   915→          for (const c of this.coins) {
+   916→            if (c.active) this.writeCoinMatrix(dummy, c, spin);
+   917→          }
+   918→          inst.instanceMatrix.needsUpdate = true;
+   919→        }
+   920→      },
+   921→    });
+   922→  }
+   923→
+   924→  private writeCoinMatrix(dummy: THREE.Object3D, c: CoinInstance, spin: number): void {
+   925→    if (!this.coinMesh) return;
+   926→    if (!c.active) {
+   927→      dummy.position.set(0, -1000, 0);
+   928→      dummy.rotation.set(0, 0, 0);
+   929→      dummy.scale.setScalar(0.001);
+   930→    } else {
+   931→      dummy.position.copy(c.pos);
+   932→      dummy.rotation.set(0, spin + c.idx * 0.7, 0);
+   933→      dummy.scale.setScalar(1);
+   934→    }
+   935→    dummy.updateMatrix();
+   936→    this.coinMesh.setMatrixAt(c.idx, dummy.matrix);
+   937→  }
+   938→
+   939→  /** Hide a coin & schedule its respawn. */
+   940→  consumeCoin(c: CoinInstance): void {
+   941→    c.active = false;
+   942→    c.respawnAt = performance.now() + PHYS.coinRespawnMs;
+   943→  }
+   944→
+   945→  // ------------------------------------------------------------ finish arch
+   946→
+   947→  private buildFinishArch(): void {
+   948→    const sm = this.spline.sampleAt(0);
+   949→    this.finishPos.copy(sm.pos);
+   950→    const pillarGeo = new THREE.BoxGeometry(1.1, 6.5, 1.1);
+   951→    const pillarMat = mat(0xe8e8ee);
+   952→    for (const side of [-1, 1]) {
+   953→      const p = new THREE.Mesh(pillarGeo, pillarMat);
+   954→      p.position.copy(sm.pos).addScaledVector(sm.right, side * (sm.halfWidth + 1.6));
+   955→      p.position.y += 3.25;
+   956→      this.group.add(p);
+   957→    }
+   958→    // banner with scrolling checker
+   959→    const tex = makeBannerTexture();
+   960→    const banner = new THREE.Mesh(
+   961→      new THREE.BoxGeometry((sm.halfWidth + 2.2) * 2, 2.2, 0.35),
+   962→      [mat(0x222233), mat(0x222233), mat(0x222233), mat(0x222233), new THREE.MeshBasicMaterial({ map: tex }), new THREE.MeshBasicMaterial({ map: tex })],
+   963→    );
+   964→    banner.position.copy(sm.pos).add(new THREE.Vector3(0, 6.4, 0));
+   965→    banner.rotation.y = -Math.atan2(sm.tangent.z, sm.tangent.x);
+   966→    this.group.add(banner);
+   967→    this.animatables.push({ update: (t) => { tex.offset.x = t * 0.15; } });
+   968→  }
+   969→
+   970→  // ------------------------------------------------------------ hazards
+   971→
+   972→  private buildHazards(): void {
+   973→    for (const def of this.def.hazards) {
+   974→      const inst = this.makeHazard(def);
+   975→      if (inst) { this.hazards.push(inst); this.group.add(inst.mesh); }
+   976→    }
+   977→  }
+   978→
+   979→  private makeHazard(def: HazardDef): HazardInstance | null {
+   980→    const sm = this.spline.sampleAt(this.mirror ? 1 - def.at : def.at);
+   981→    const roadHalf = sm.halfWidth;
+   982→
+   983→    switch (def.kind) {
+   984→      case 'mover': {
+   985→        const mesh = makeMoverMesh(def.label ?? 'rock');
+   986→        // sweep only ~42% of the road width: dodging room on BOTH sides
+   987→        // (55% crammed the whole pack into one dodge lane and jammed chicanes)
+   988→        const amp = (roadHalf - 1) * 0.42;
+   989→        const speed = def.speed ?? 8;
+   990→        const phase = def.phase ?? 0;
+   991→        const pos = new THREE.Vector3();
+   992→        const inst: HazardInstance = {
+   993→          def, mesh, pos, radius: def.radius ?? 1.5, active: true,
+   994→          update: (t) => {
+   995→            const lat = Math.sin(phase + t * speed / Math.max(amp, 1)) * amp;
+   996→            const p = this.spline.roadPoint(def.at, lat);
+   997→            pos.copy(p).add(new THREE.Vector3(0, mesh.userData.lift ?? 0.7, 0));
+   998→            mesh.position.copy(pos);
+   999→            mesh.rotation.y = t * (mesh.userData.spin ?? 1.5);
+  1000→          },
+  1001→        };
+  1002→        return inst;
+  1003→      }
+  1004→      case 'faller': {
+  1005→        const mesh = makeFallerMesh(def.label ?? 'lavarock');
+  1006→        const period = def.period ?? 3;
+  1007→        const phase = def.phase ?? 0;
+  1008→        const top = sm.pos.y + 26;
+  1009→        const pos = new THREE.Vector3();
+  1010→        // telegraph ring
+  1011→        const ring = new THREE.Mesh(new THREE.RingGeometry(0.8, 1.5, 12),
+  1012→          new THREE.MeshBasicMaterial({ color: 0xff4422, transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
+  1013→        ring.rotation.x = -Math.PI / 2;
+  1014→        ring.position.copy(sm.pos).add(new THREE.Vector3(0, 0.08, 0));
+  1015→        this.group.add(ring);
+  1016→        const inst: HazardInstance = {
+  1017→          def, mesh, pos, radius: def.radius ?? 1.6, active: false,
+  1018→          update: (t) => {
+  1019→            const cyc = ((t + phase) % period) / period;
+  1020→            const fallT = Math.max(0, cyc - 0.35) / 0.65; // 35% hover, 65% fall
+  1021→            const y = top - fallT * (top - sm.pos.y);
+  1022→            pos.set(sm.pos.x, Math.min(y, sm.pos.y), sm.pos.z);
+  1023→            mesh.position.copy(pos);
+  1024→            mesh.rotation.x += 0.05; mesh.rotation.z += 0.03;
+  1025→            const near = y - sm.pos.y < 2.2;
+  1026→            inst.active = near && fallT > 0.9 ? true : near;
+  1027→            ring.scale.setScalar(0.9 + cyc * 0.5);
+  1028→            (ring.material as THREE.MeshBasicMaterial).opacity = 0.2 + cyc * 0.5;
+  1029→          },
+  1030→        };
+  1031→        return inst;
+  1032→      }
+  1033→      case 'zone': {
+  1034→        const mesh = makeZoneMesh(def, sm);
+  1035→        const pos = sm.pos.clone();
+  1036→        const inst: HazardInstance = {
+  1037→          def, mesh, pos, radius: def.radius ?? 8, active: true,
+  1038→          update: (t) => { mesh.rotation.z = t * 0.3; },
+  1039→        };
+  1040→        return inst;
+  1041→      }
+  1042→      case 'gate': {
+  1043→        const frame = new THREE.Group();
+  1044→        const postMat = mat(0x555566);
+  1045→        for (const side of [-1, 1]) {
+  1046→          const post = new THREE.Mesh(new THREE.BoxGeometry(0.6, 4.6, 0.6), postMat);
+  1047→          post.position.copy(sm.pos).addScaledVector(sm.right, side * (roadHalf + 0.3));
+  1048→          post.position.y += 2.3;
+  1049→          frame.add(post);
+  1050→        }
+  1051→        const wallMat = new THREE.MeshBasicMaterial({
+  1052→          color: def.label === 'prism' ? 0xff5a8a : def.label === 'airlock' ? 0x35e0ff : 0xffb63a,
+  1053→          transparent: true, opacity: 0.75, side: THREE.DoubleSide,
+  1054→        });
+  1055→        const wall = new THREE.Mesh(new THREE.PlaneGeometry(roadHalf * 2, 4.2), wallMat);
+  1056→        wall.position.copy(sm.pos).add(new THREE.Vector3(0, 2.1, 0));
+  1057→        wall.rotation.y = -Math.atan2(sm.tangent.z, sm.tangent.x) + Math.PI / 2;
+  1058→        frame.add(wall);
+  1059→        const period = def.period ?? 2.5;
+  1060→        const phase = def.phase ?? 0;
+  1061→        const pos = wall.position.clone();
+  1062→        const inst: HazardInstance = {
+  1063→          def, mesh: frame, pos, radius: roadHalf + 0.6, active: true,
+  1064→          update: (t) => {
+  1065→            const cyc = ((t + phase) / period) % 1;
+  1066→            const active = cyc < 0.52;
+  1067→            inst.active = active;
+  1068→            wallMat.opacity = active ? 0.75 : 0.08;
+  1069→            wall.scale.y = active ? 1 : 0.25;
+  1070→          },
+  1071→        };
+  1072→        return inst;
+  1073→      }
+  1074→    }
+  1075→    return null;
+  1076→  }
+  1077→
+  1078→  // ------------------------------------------------------------ spawns
+  1079→
+  1080→  private buildSpawns(): void {
+  1081→    const sp = this.spline;
+  1082→    for (let i = 0; i < 12; i++) {
+  1083→      const row = Math.floor(i / 2);
+  1084→      const col = i % 2 === 0 ? -1 : 1;
+  1085→      const s = Spline.wrapS(-(7 + row * 3.4) / sp.length);
+  1086→      const lateral = col * 2.7;
+  1087→      this.spawnPoints.push(sp.roadPoint(s, lateral));
+  1088→    }
+  1089→    // respawn anchors: nearest SOLID sample per sector (never mid-gap)
+  1090→    for (let k = 0; k < 12; k++) {
+  1091→      let s = (k + 0.5) / 12;
+  1092→      const sm = sp.sampleAt(s);
+  1093→      if (sm.jump) {
+  1094→        // nudge forward to next solid sample
+  1095→        for (let d = 0.004; d < 0.1; d += 0.004) {
+  1096→          if (!sp.sampleAt(Spline.wrapS(s + d)).jump) { s = Spline.wrapS(s + d); break; }
+  1097→        }
+  1098→      }
+  1099→      this.respawnPoints.push(sp.roadPoint(s, 0));
+  1100→    }
+  1101→  }
+  1102→
+  1103→  // ------------------------------------------------------------ decorations
+  1104→
+  1105→  private buildDecorations(decorScale: number, crowdScale: number): void {
+  1106→    const rng = makeRng(this.def.id.length * 7919 + 13);
+  1107→    const style = this.style;
+  1108→    const sp = this.spline;
+  1109→
+  1110→    // scatter props along both sides of the road
+  1111→    if (style.props.length > 0 && style.skirt > 4) {
+  1112→      const perKind = Math.floor(52 * style.propDensity * decorScale);
+  1113→      for (const kind of style.props) {
+  1114→        for (let i = 0; i < perKind; i++) {
+  1115→          const s = rng();
+  1116→          const sm = sp.sampleAt(s);
+  1117→          if (sm.tunnel) continue; // don't plant trees inside tunnels
+  1118→          const side = rng() > 0.5 ? 1 : -1;
+  1119→          const lateral = side * (sm.halfWidth + 5 + rng() * Math.max(2, style.skirt * 0.6));
+  1120→          const pos = sp.roadPoint(s, lateral);
+  1121→          pos.y -= 0.15;
+  1122→          const prop = buildProp(kind as PropKind, rng, this.def.theme);
+  1123→          prop.position.copy(pos);
+  1124→          prop.rotation.y = rng() * Math.PI * 2;
+  1125→          this.group.add(prop);
+  1126→          if ((prop.children[0] as THREE.Mesh & { userData: { spin?: number } }).userData?.spin) {
+  1127→            const spin = (prop.children[0] as THREE.Mesh & { userData: { spin?: number } }).userData.spin ?? 0.3;
+  1128→            this.animatables.push({ update: (_t, dt) => { prop.children[0].rotation.z += dt * spin; } });
+  1129→          }
+  1130→        }
+  1131→      }
+  1132→    } else if (style.props.length > 0) { // void themes: float props beside road
+  1133→      const perKind = Math.floor(26 * style.propDensity * decorScale);
+  1134→      for (const kind of style.props) {
+  1135→        for (let i = 0; i < perKind; i++) {
+  1136→          const s = rng();
+  1137→          const sm = sp.sampleAt(s);
+  1138→          if (sm.tunnel) continue;
+  1139→          const side = rng() > 0.5 ? 1 : -1;
+  1140→          const lateral = side * (sm.halfWidth + 6 + rng() * 16);
+  1141→          const pos = sp.roadPoint(s, lateral);
+  1142→          pos.y += rng() * 6 - 2;
+  1143→          const prop = buildProp(kind as PropKind, rng, this.def.theme);
+  1144→          prop.position.copy(pos);
+  1145→          this.group.add(prop);
+  1146→          this.animatables.push({ update: (t) => { prop.position.y = pos.y + Math.sin(t * 0.7 + i) * 0.8; prop.rotation.y += 0.002; } });
+  1147→        }
+  1148→      }
+  1149→    }
+  1150→
+  1151→    // sky
+  1152→    this.group.add(buildSky(style, this.def.theme));
+  1153→
+  1154→    // crowd grandstands beside the start straight
+  1155→    // (buildCrowd builds in a local frame: X along the road, Z away from it —
+  1156→    // the stands now run PARALLEL to the start straight, never across it)
+  1157→    if (crowdScale > 0) {
+  1158→      const s0 = 0.02;
+  1159→      const sm = sp.sampleAt(s0);
+  1160→      const along = new THREE.Vector3(sm.tangent.x, 0, sm.tangent.z).normalize();
+  1161→      // left-side stand (lateral < 0): steps away along -right
+  1162→      const baseL = sp.roadPoint(s0, -sm.halfWidth - 7.2);
+  1163→      baseL.y -= 0.25; // sit on the skirt terrain, which slopes off the kerb
+  1164→      const crowdL = buildCrowd(Math.floor(72 * crowdScale), baseL, along, sm.right.clone().negate(), 42);
+  1165→      this.group.add(crowdL.group);
+  1166→      this.animatables.push({ update: (t) => crowdL.update(t) });
+  1167→      // right-side stand
+  1168→      const baseR = sp.roadPoint(s0, sm.halfWidth + 7.2);
+  1169→      baseR.y -= 0.25;
+  1170→      const crowdR = buildCrowd(Math.floor(56 * crowdScale), baseR, along, sm.right.clone(), 42);
+  1171→      this.group.add(crowdR.group);
+  1172→      this.animatables.push({ update: (t) => crowdR.update(t) });
+  1173→    }
+  1174→  }
+  1175→
+  1176→  // ------------------------------------------------------------ edge dressing
+  1177→
+  1178→  /**
+  1179→   * Everything that makes the road VERGE read as a raced-on circuit instead
+  1180→   * of an empty ribbon: sponsor billboards, tyre stacks on corner outsides,
+  1181→   * chevron boards before corner entries, reflector delineator posts and
+  1182→   * instanced verge scrub. All merged/instanced — ~9 extra draw calls.
+  1183→   */
+  1184→  private buildEdgeDressing(decorScale: number): void {
+  1185→    const sp = this.spline;
+  1186→    const N = sp.samples.length;
+  1187→    const theme = this.def.theme;
+  1188→    const rng = makeRng(this.def.id.length * 613 + 91);
+  1189→    const skip = this.style.skirt <= 3; // void themes keep clean edges
+  1190→
+  1191→    // signed curvature (rad/m) — same recipe as the racing line
+  1192→    const kappa = new Float32Array(N);
+  1193→    for (let i = 0; i < N; i++) {
+  1194→      const a = sp.samples[(i - 3 + N) % N];
+  1195→      const b = sp.samples[(i + 3) % N];
+  1196→      const cross = a.tangent.x * b.tangent.z - a.tangent.z * b.tangent.x;
+  1197→      const ds = Math.max(0.5, b.pos.distanceTo(a.pos));
+  1198→      kappa[i] = Math.asin(Math.max(-1, Math.min(1, cross))) / ds;
+  1199→    }
+  1200→    // ok to dress? (not in a tunnel, not over a gap, not in a rail window)
+  1201→    const dressable = (i: number, side: 1 | -1): boolean => {
+  1202→      const sm = sp.samples[i];
+  1203→      if (sm.tunnel || sm.jump) return false;
+  1204→      if (sp.samples[(i + 1) % N].jump) return false;
+  1205→      if (sp.samples[(i - 1 + N) % N].jump) return false;
+  1206→      const open = side < 0 ? this.railOpen.left : this.railOpen.right;
+  1207→      for (let k = -6; k <= 6; k++) if (open[((i + k) % N + N) % N]) return false;
+  1208→      return true;
+  1209→    };
+  1210→    // kappa<0 = left turn (inside is +lat, i.e. the track-left side)
+  1211→    const outsideSign = (k: number): 1 | -1 => (k < 0 ? -1 : 1);
+  1212→
+  1213→    // ---- 1. sponsor billboards every ~75 m, alternating sides --------------
+  1214→    if (!skip) {
+  1215→      const step = 75 / sp.length;
+  1216→      let side: 1 | -1 = 1;
+  1217→      let bi = 0;
+  1218→      const panelGeos: THREE.BufferGeometry[][] = [[], [], [], []];
+  1219→      const postGeos: THREE.BufferGeometry[] = [];
+  1220→      for (let s = 0.05; s < 1; s += step) {
+  1221→        const i = sp.indexAtS(Spline.wrapS(s));
+  1222→        const sm = sp.samples[i];
+  1223→        if (!dressable(i, side)) { side = -side as 1 | -1; continue; }
+  1224→        const lat = side * (sm.halfWidth + 4.6);
+  1225→        const base = sp.roadPoint(Spline.wrapS(s), lat);
+  1226→        // panel faces the road: normal = -side * right
+  1227→        const nrm = sm.right.clone().multiplyScalar(-side);
+  1228→        const yaw = Math.atan2(nrm.x, nrm.z);
+  1229→        const panel = new THREE.PlaneGeometry(7.2, 2.3);
+  1230→        const mtx = new THREE.Matrix4().makeRotationY(yaw);
+  1231→        mtx.setPosition(base.x, base.y + 2.7, base.z);
+  1232→        panelGeos[bi % 4].push(panel.clone().applyMatrix4(mtx));
+  1233→        // two legs
+  1234→        for (const lx of [-2.6, 2.6]) {
+  1235→          const leg = new THREE.CylinderGeometry(0.11, 0.13, 2.9, 6);
+  1236→          const m2 = new THREE.Matrix4().makeRotationY(yaw);
+  1237→          const off = new THREE.Vector3(lx, 1.15, 0).applyMatrix4(new THREE.Matrix4().makeRotationY(yaw));
+  1238→          m2.setPosition(base.x + off.x, base.y + 1.15, base.z + off.z);
+  1239→          postGeos.push(leg.applyMatrix4(m2));
+  1240→        }
+  1241→        bi++;
+  1242→        side = -side as 1 | -1;
+  1243→      }
+  1244→      for (let t = 0; t < 4; t++) {
+  1245→        if (!panelGeos[t].length) continue;
+  1246→        const merged = mergeGeometries(panelGeos[t]);
+  1247→        if (!merged) continue;
+  1248→        const mesh = new THREE.Mesh(merged,
+  1249→          new THREE.MeshLambertMaterial({ map: billboardTexture(t), side: THREE.DoubleSide }));
+  1250→        mesh.castShadow = false;
+  1251→        this.group.add(mesh);
+  1252→      }
+  1253→      if (postGeos.length) {
+  1254→        const merged = mergeGeometries(postGeos);
+  1255→        if (merged) this.group.add(new THREE.Mesh(merged, mat(0x3c414c)));
+  1256→        for (const g of postGeos) g.dispose();
+  1257→      }
+  1258→    }
+  1259→
+  1260→    // ---- 2. tyre stacks on corner outsides (instanced tori) -----------------
+  1261→    if (!skip) {
+  1262→      const spots: { pos: THREE.Vector3 }[] = [];
+  1263→      let i = 0;
+  1264→      while (i < N) {
+  1265→        if (Math.abs(kappa[i]) < 0.035) { i++; continue; }
+  1266→        let end = i;
+  1267→        while (end < N && Math.abs(kappa[end]) >= 0.028) end++;
+  1268→        const runLen = (end - i) * (sp.length / N);
+  1269→        const side = outsideSign(kappa[(i + end) >> 1]);
+  1270→        if (runLen > 12) {
+  1271→          const every = Math.max(3, Math.round(4.5 / (sp.length / N)));
+  1272→          for (let k = i; k < end - 2; k += every) {
+  1273→            if (!dressable(k, side)) continue;
+  1274→            const sm = sp.samples[k];
+  1275→            spots.push({ pos: sp.roadPoint(sm.s, side * (sm.halfWidth + 2.0)) });
+  1276→            if (spots.length >= 110) break;
+  1277→          }
+  1278→        }
+  1279→        if (spots.length >= 110) break;
+  1280→        i = end;
+  1281→      }
+  1282→      if (spots.length) {
+  1283→        const tyreGeo = new THREE.TorusGeometry(0.55, 0.22, 8, 14);
+  1284→        tyreGeo.rotateX(Math.PI / 2);
+  1285→        const tyres = new THREE.InstancedMesh(tyreGeo,
+  1286→          new THREE.MeshLambertMaterial({ color: 0xffffff }), spots.length * 2);
+  1287→        const m = new THREE.Matrix4();
+  1288→        const q = new THREE.Quaternion();
+  1289→        const sc = new THREE.Vector3(1, 1, 1);
+  1290→        let n = 0;
+  1291→        for (let sIdx = 0; sIdx < spots.length; sIdx++) {
+  1292→          const p = spots[sIdx].pos;
+  1293→          // bottom tyre
+  1294→          m.compose(new THREE.Vector3(p.x, p.y + 0.24, p.z), q, sc);
+  1295→          tyres.setMatrixAt(n, m);
+  1296→          tyres.setColorAt(n, new THREE.Color(0x181a20));
+  1297→          n++;
+  1298→          // top tyre, slightly rotated & every 3rd stack painted white
+  1299→          const q2 = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), 0.35);
+  1300→          m.compose(new THREE.Vector3(p.x, p.y + 0.62, p.z), q2, sc);
+  1301→          tyres.setMatrixAt(n, m);
+  1302→          tyres.setColorAt(n, new THREE.Color(sIdx % 3 === 1 ? 0xe8e8ee : 0x232630));
+  1303→          n++;
+  1304→        }
+  1305→        tyres.instanceMatrix.needsUpdate = true;
+  1306→        this.group.add(tyres);
+  1307→      }
+  1308→    }
+  1309→
+  1310→    // ---- 3. chevron boards before corner entries ------------------------------
+  1311→    if (!skip) {
+  1312→      const boards: { pos: THREE.Vector3; yaw: number; flip: boolean }[] = [];
+  1313→      const lookAhead = Math.max(2, Math.round(14 / (sp.length / N)));
+  1314→      for (let i = 0; i < N; i++) {
+  1315→        if (Math.abs(kappa[i]) > 0.012) continue;
+  1316→        const j = (i + lookAhead) % N;
+  1317→        if (Math.abs(kappa[j]) < 0.05) continue;
+  1318→        const k = kappa[(j + 4) % N];
+  1319→        const side = outsideSign(k);
+  1320→        // place ~14 m before the entry, on the OUTSIDE, facing oncoming traffic
+  1321→        const back = Math.max(2, Math.round(14 / (sp.length / N)));
+  1322→        const at = (i - back + N) % N;
+  1323→        if (!dressable(at, side)) continue;
+  1324→        const sm = sp.samples[at];
+  1325→        const pos = sp.roadPoint(sm.s, side * (sm.halfWidth + 2.9));
+  1326→        const yaw = Math.atan2(-sm.tangent.x, -sm.tangent.z); // face backwards along the road
+  1327→        if (boards.length && boards[boards.length - 1].pos.distanceToSquared(pos) < 30 * 30) continue;
+  1328→        boards.push({ pos, yaw, flip: k < 0 });
+  1329→        if (boards.length >= 12) break;
+  1330→      }
+  1331→      if (boards.length) {
+  1332→        const geo = new THREE.PlaneGeometry(2.3, 1.15);
+  1333→        const mtx = new THREE.Matrix4();
+  1334→        const chevGeos: THREE.BufferGeometry[] = [];
+  1335→        for (const b of boards) {
+  1336→          const g = geo.clone();
+  1337→          if (b.flip) g.scale(-1, 1, 1);
+  1338→          mtx.makeRotationY(b.yaw);
+  1339→          mtx.setPosition(b.pos.x, b.pos.y + 1.5, b.pos.z);
+  1340→          chevGeos.push(g.applyMatrix4(mtx));
+  1341→        }
+  1342→        const merged = mergeGeometries(chevGeos);
+  1343→        if (merged) {
+  1344→          this.group.add(new THREE.Mesh(merged, new THREE.MeshBasicMaterial({
+  1345→            map: chevronTexture(), side: THREE.DoubleSide,
+  1346→          })));
+  1347→        }
+  1348→        for (const g of chevGeos) g.dispose();
+  1349→        // posts under the boards
+  1350→        const postGeos: THREE.BufferGeometry[] = [];
+  1351→        for (const b of boards) {
+  1352→          const leg = new THREE.CylinderGeometry(0.07, 0.07, 1.6, 5);
+  1353→          const m2 = new THREE.Matrix4();
+  1354→          m2.makeTranslation(b.pos.x, b.pos.y + 0.8, b.pos.z);
+  1355→          postGeos.push(leg.applyMatrix4(m2));
+  1356→        }
+  1357→        const pm = mergeGeometries(postGeos);
+  1358→        if (pm) this.group.add(new THREE.Mesh(pm, mat(0x555a66)));
+  1359→        for (const g of postGeos) g.dispose();
+  1360→      }
+  1361→    }
+  1362→
+  1363→    // ---- 4. reflector delineator posts (instanced, both edges) ---------------
+  1364→    {
+  1365→      const dark = ['city', 'space', 'volcano', 'prism'].includes(theme);
+  1366→      const every = Math.max(2, Math.round(16 / (sp.length / N)));
+  1367→      const spots: THREE.Vector3[] = [];
+  1368→      for (let i = 0; i < N; i += every) {
+  1369→        for (const side of [-1, 1] as const) {
+  1370→          if (!dressable(i, side)) continue;
+  1371→          const sm = sp.samples[i];
+  1372→          spots.push(sp.roadPoint(sm.s, side * (sm.halfWidth + 1.15)));
+  1373→        }
+  1374→      }
+  1375→      if (spots.length) {
+  1376→        const postGeo = new THREE.CylinderGeometry(0.055, 0.07, 0.85, 5);
+  1377→        postGeo.translate(0, 0.42, 0);
+  1378→        const posts = new THREE.InstancedMesh(postGeo,
+  1379→          new THREE.MeshLambertMaterial({ color: dark ? this.style.pad : 0xf2f4f8, emissive: dark ? this.style.pad & 0x555555 : 0x000000 }),
+  1380→          spots.length);
+  1381→        const m = new THREE.Matrix4();
+  1382→        for (let k = 0; k < spots.length; k++) {
+  1383→          m.makeTranslation(spots[k].x, spots[k].y - 0.05, spots[k].z);
+  1384→          posts.setMatrixAt(k, m);
+  1385→        }
+  1386→        posts.instanceMatrix.needsUpdate = true;
+  1387→        this.group.add(posts);
+  1388→      }
+  1389→    }
+  1390→
+  1391→    // ---- 5. verge scrub (instanced blobs just past the kerb) -----------------
+  1392→    if (!skip && decorScale > 0.35) {
+  1393→      const colorBy: Record<string, number> = {
+  1394→        meadow: 0x4f9a3e, castle: 0x568a44, jungle: 0x2f7f36, desert: 0xb8a06a,
+  1395→        beach: 0x8fc88a, snow: 0xe6f0fa, glacier: 0xd0e4f4, volcano: 0x4a3a34,
+  1396→        factory: 0x5a5e52, city: 0x3c4148,
+  1397→      };
+  1398→      const col = colorBy[theme] ?? 0x4f9a3e;
+  1399→      const every = Math.max(2, Math.round(11 / (sp.length / N)));
+  1400→      const spots: { p: THREE.Vector3; s: number }[] = [];
+  1401→      for (let i = 0; i < N; i += every) {
+  1402→        const side = rng() > 0.5 ? 1 : -1;
+  1403→        if (!dressable(i, side as 1 | -1)) continue;
+  1404→        const sm = sp.samples[i];
+  1405→        const lat = side * (sm.halfWidth + 1.9 + rng() * 1.8);
+  1406→        spots.push({ p: sp.roadPoint(sm.s, lat), s: 0.55 + rng() * 0.75 });
+  1407→      }
+  1408→      if (spots.length) {
+  1409→        const geo = new THREE.IcosahedronGeometry(0.5, 0);
+  1410→        geo.scale(1.25, 0.75, 1.25);
+  1411→        const scrub = new THREE.InstancedMesh(geo,
+  1412→          new THREE.MeshLambertMaterial({ color: col }), spots.length);
+  1413→        const m = new THREE.Matrix4();
+  1414→        const q = new THREE.Quaternion();
+  1415→        for (let k = 0; k < spots.length; k++) {
+  1416→          q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), rng() * Math.PI);
+  1417→          m.compose(new THREE.Vector3(spots[k].p.x, spots[k].p.y + 0.12, spots[k].p.z), q,
+  1418→            new THREE.Vector3(spots[k].s, spots[k].s * 0.9, spots[k].s));
+  1419→          scrub.setMatrixAt(k, m);
+  1420→        }
+  1421→        scrub.instanceMatrix.needsUpdate = true;
+  1422→        this.group.add(scrub);
+  1423→      }
+  1424→    }
+  1425→  }
+  1426→
+  1427→  // ------------------------------------------------------------ bunting
+  1428→
+  1429→  /**
+  1430→   * Overhead pennant strings strung across the track every ~90 m — the
+  1431→   * canopy-of-flags look of a classic party racer. Skipped over jumps,
+  1432→   * tunnels and void themes.
+  1433→   */
+  1434→  private buildBunting(): void {
+  1435→    if (this.style.skirt <= 3) return;
+  1436→    const sp = this.spline;
+  1437→    const N = sp.samples.length;
+  1438→    const colA = this.style.curbA, colB = this.style.curbB;
+  1439→
+  1440→    const flagGeos: [THREE.BufferGeometry[], THREE.BufferGeometry[]] = [[], []];
+  1441→    const ropeGeos: THREE.BufferGeometry[] = [];
+  1442→    const poleGeos: THREE.BufferGeometry[] = [];
+  1443→    let made = 0;
+  1444→
+  1445→    const spanOk = (i: number): boolean => {
+  1446→      for (const k of [-2, -1, 0, 1, 2]) {
+  1447→        const sm = sp.samples[((i + k) % N + N) % N];
+  1448→        if (sm.tunnel || sm.jump) return false;
+  1449→      }
+  1450→      const openL = this.railOpen.left, openR = this.railOpen.right;
+  1451→      for (let k = -4; k <= 4; k++) {
+  1452→        const j = ((i + k) % N + N) % N;
+  1453→        if (openL[j] || openR[j]) return false;
+  1454→      }
+  1455→      return true;
+  1456→    };
+  1457→
+  1458→    const step = 90 / sp.length;
+  1459→    for (let s = 0.13; s < 0.97; s += step) {
+  1460→      const i = sp.indexAtS(Spline.wrapS(s));
+  1461→      if (!spanOk(i)) continue;
+  1462→      const sm = sp.samples[i];
+  1463→      const H = 6.6;
+  1464→      const a = sp.roadPoint(Spline.wrapS(s), -(sm.halfWidth + 1.1)).add(new THREE.Vector3(0, H, 0));
+  1465→      const b = sp.roadPoint(Spline.wrapS(s), sm.halfWidth + 1.1).add(new THREE.Vector3(0, H, 0));
+  1466→      const yaw = Math.atan2(sm.tangent.x, sm.tangent.z);
+  1467→      // anchor poles
+  1468→      for (const p of [a, b]) {
+  1469→        const pole = new THREE.CylinderGeometry(0.07, 0.09, H, 6);
+  1470→        const m = new THREE.Matrix4();
+  1471→        m.makeRotationY(yaw);
+  1472→        m.setPosition(p.x, p.y - H / 2, p.z);
+  1473→        poleGeos.push(pole.applyMatrix4(m));
+  1474→      }
+  1475→      // sagging rope: parabola dip 0.55 m, 8 segments
+  1476→      const SEG = 8;
+  1477→      const pts: THREE.Vector3[] = [];
+  1478→      for (let k = 0; k <= SEG; k++) {
+  1479→        const u = k / SEG;
+  1480→        const dip = 4 * 0.55 * u * (1 - u);      // parabola: 0 at ends, max mid
+  1481→        pts.push(new THREE.Vector3().lerpVectors(a, b, u).add(new THREE.Vector3(0, -dip, 0)));
+  1482→      }
+  1483→      for (let k = 0; k < SEG; k++) {
+  1484→        const p0 = pts[k], p1 = pts[k + 1];
+  1485→        const mid = new THREE.Vector3().addVectors(p0, p1).multiplyScalar(0.5);
+  1486→        const len = p0.distanceTo(p1);
+  1487→        const seg = new THREE.CylinderGeometry(0.025, 0.025, len, 4);
+  1488→        const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3().subVectors(p1, p0).normalize());
+  1489→        const m = new THREE.Matrix4().makeRotationFromQuaternion(q);
+  1490→        m.setPosition(mid.x, mid.y, mid.z);
+  1491→        ropeGeos.push(seg.applyMatrix4(m));
+  1492→      }
+  1493→      // pennant flags hanging from the rope points (skip the 2 pole ends)
+  1494→      for (let k = 1; k < SEG; k++) {
+  1495→        const flag = new THREE.ConeGeometry(0.3, 0.62, 4);
+  1496→        flag.rotateX(Math.PI);                     // point down
+  1497→        const m = new THREE.Matrix4().makeRotationY(yaw);
+  1498→        m.setPosition(pts[k].x, pts[k].y - 0.36, pts[k].z);
+  1499→        flagGeos[(k + made) % 2].push(flag.applyMatrix4(m));
+  1500→      }
+  1501→      made++;
+  1502→      if (made >= 14) break;                       // enough canopy for one lap
+  1503→    }
+  1504→
+  1505→    if (poleGeos.length) {
+  1506→      const merged = mergeGeometries(poleGeos);
+  1507→      if (merged) this.group.add(new THREE.Mesh(merged, mat(0x2e313c)));
+  1508→      for (const g of poleGeos) g.dispose();
+  1509→    }
+  1510→    if (ropeGeos.length) {
+  1511→      const merged = mergeGeometries(ropeGeos);
+  1512→      if (merged) this.group.add(new THREE.Mesh(merged, mat(0x1c1e26)));
+  1513→      for (const g of ropeGeos) g.dispose();
+  1514→    }
+  1515→    for (const [geos, color] of [[flagGeos[0], colA], [flagGeos[1], colB]] as [THREE.BufferGeometry[], number][]) {
+  1516→      if (!geos.length) continue;
+  1517→      const merged = mergeGeometries(geos);
+  1518→      if (!merged) continue;
+  1519→      const mesh = new THREE.Mesh(merged,
+  1520→        new THREE.MeshLambertMaterial({ color, side: THREE.DoubleSide }));
+  1521→      this.group.add(mesh);
+  1522→      for (const g of geos) g.dispose();
+  1523→    }
+  1524→  }
+  1525→
+  1526→  // ------------------------------------------------------------ racing line
+  1527→
+  1528→  /**
+  1529→   * Precomputed racing line for the AI:
+  1530→   *  - `lat`: apex-cutting lateral offset (inside of each corner, smoothed)
+  1531→   *  - `vMax`: physical speed profile — corner limits from curvature, then a
+  1532→   *    backward pass (braking) and forward pass (acceleration) so bots brake
+  1533→   *    BEFORE the corner and power out of it, like real drivers.
+  1534→   */
+  1535→  private computeRacingLine(): RacingLine {
+  1536→    const sp = this.spline;
+  1537→    const N = sp.samples.length;
+  1538→    const lat = new Float32Array(N);
+  1539→    const vMax = new Float32Array(N);
+  1540→
+  1541→    // signed curvature (rad per meter) between tangent[i-3] and tangent[i+3]
+  1542→    const kappa = new Float32Array(N);
+  1543→    for (let i = 0; i < N; i++) {
+  1544→      const a = sp.samples[(i - 3 + N) % N];
+  1545→      const b = sp.samples[(i + 3) % N];
+  1546→      const cross = a.tangent.x * b.tangent.z - a.tangent.z * b.tangent.x;
+  1547→      const ds = Math.max(0.5, b.pos.distanceTo(a.pos));
+  1548→      kappa[i] = Math.asin(clampN(cross, -1, 1)) / ds;
+  1549→    }
+  1550→
+  1551→    // apex lateral: inside of the turn; magnitude scales with curvature
+  1552→    for (let i = 0; i < N; i++) {
+  1553→      const k = kappa[i];
+  1554→      const strength = Math.min(1, Math.abs(k) * 85);
+  1555→      const room = Math.max(0, sp.samples[i].halfWidth - 2.8);
+  1556→      lat[i] = (k < 0 ? 1 : -1) * strength * room; // kappa<0 → turn toward +X → inside is +lat
+  1557→    }
+  1558→    // smooth twice with a wide circular-ish box filter (wrap-aware)
+  1559→    const smooth = (src: Float32Array, radius: number): Float32Array => {
+  1560→      const out = new Float32Array(N);
+  1561→      for (let i = 0; i < N; i++) {
+  1562→        let acc = 0, cnt = 0;
+  1563→        for (let d = -radius; d <= radius; d++) {
+  1564→          acc += src[(i + d + N) % N];
+  1565→          cnt++;
+  1566→        }
+  1567→        out[i] = acc / cnt;
+  1568→      }
+  1569→      return out;
+  1570→    };
+  1571→    let latS = smooth(lat, 12);
+  1572→    latS = smooth(latS, 8);
+  1573→    for (let i = 0; i < N; i++) {
+  1574→      const room = Math.max(0, sp.samples[i].halfWidth - 2.6);
+  1575→      latS[i] = clampN(latS[i], -room, room);
+  1576→    }
+  1577→
+  1578→    // corner speed from lateral acceleration limit (arcadey: high grip),
+  1579→    // with an arcade FLOOR of 12.5 m/s. The old floor (15) demanded
+  1580→    // 18.7 m/s² of lateral grip through radius-12 hairpins — physically
+  1581→    // impossible (grip tops at ~13.5), so bots understeered wide off every
+  1582→    // tight switchback and wallowed in the grass. 12.5 clears a 12 m radius
+  1583→    // at the limit; hairpin convoys stay prevented by the match-and-pass
+  1584→    // car-following, not by a hot floor.
+  1585→    const aLat = 13.5;
+  1586→    const brake = 13.0;
+  1587→    const accel = 8.5;
+  1588→    const vTop = 30.0;
+  1589→    for (let i = 0; i < N; i++) {
+  1590→      const k = Math.max(Math.abs(kappa[i]), 1e-4);
+  1591→      vMax[i] = Math.max(12.5, Math.min(vTop, Math.sqrt(aLat / k)));
+  1592→    }
+  1593→    // Gap zones are FLAT OUT: hold flight speed through the approach and
+  1594→    // the landing. Letting the profile brake there piled 12 karts into the
+  1595→    // landings (rear-enders, spins, backward drivers, falls) — the classic
+  1596→    // gap-landing conga. The passes below propagate this correctly.
+  1597→    for (let i = 0; i < N; i++) {
+  1598→      if (!sp.samples[i].jump) continue;
+  1599→      for (let d = -11; d <= 14; d++) {
+  1600→        const j = (i + d + N) % N;
+  1601→        vMax[j] = Math.max(vMax[j], 26);
+  1602→      }
+  1603→    }
+  1604→    // backward pass (braking) + forward pass (traction), twice for wrap
+  1605→    for (let pass = 0; pass < 2; pass++) {
+  1606→      for (let i = N - 1; i >= 0; i--) {
+  1607→        const j = (i + 1) % N;
+  1608→        const ds = Math.max(0.5, sp.samples[j].pos.distanceTo(sp.samples[i].pos));
+  1609→        vMax[i] = Math.min(vMax[i], Math.sqrt(vMax[j] * vMax[j] + 2 * brake * ds));
+  1610→      }
+  1611→      for (let i = 1; i <= N; i++) {
+  1612→        const j = i % N;
+  1613→        const p = i - 1;
+  1614→        const ds = Math.max(0.5, sp.samples[j].pos.distanceTo(sp.samples[p].pos));
+  1615→        vMax[j] = Math.min(vMax[j], Math.sqrt(vMax[p] * vMax[p] + 2 * accel * ds));
+  1616→      }
+  1617→    }
+  1618→
+  1619→    return { lat: latS, vMax };
+  1620→  }
+  1621→
+  1622→  // ------------------------------------------------------------ queries
+  1623→
+  1624→  /** True if sample idx sits inside or beside a jump run (gap span).
+  1625→ *  Window is ±1 sample: the actual hole edges — a wider window also
+  1626→ *  voided the LANDING shoulders and swallowed off-center flights that
+  1627→ *  should have survived on the widened landing run-out. */
+  1628→  private nearJumpRun(idx: number): boolean {
+  1629→    const sp = this.spline;
+  1630→    const N = sp.samples.length;
+  1631→    for (let k = -1; k <= 1; k++) {
+  1632→      if (sp.samples[((idx + k) % N + N) % N].jump) return true;
+  1633→    }
+  1634→    return false;
+  1635→  }
+  1636→
+  1637→  /** Single ground/environment query used by kart physics. */
+  1638→  groundQuery(p: THREE.Vector3, state: { mainIdx: number; pathIdx: number; ptIdx: number }): GroundInfo {
+  1639→    const sp = this.spline;
+  1640→
+  1641→    // --- main spline (first: the entry gate below needs track progress) ----
+  1642→    const proj: Projection = sp.project(p, state.mainIdx);
+  1643→    const sm = sp.samples[proj.index];
+  1644→
+  1645→    // --- shortcut branch ----------------------------------------------------
+  1646→    // Adoption is STRICT: either the kart was already on the branch last
+  1647→    // frame (continuation), or it is ENTERING — physically near the ribbon
+  1648→    // START, at a track progress equal to the branch's from-progress, and
+  1649→    // projecting onto the first few ribbon steps. Mid-span proximity
+  1650→    // adoption used to hand out the whole mapped span as free progress
+  1651→    // (prism's coil bypass = 183 m) and yanked karts off the main road.
+  1652→    let pathId = -1;
+  1653→    let scLat = Infinity;
+  1654→    let scS = 0;
+  1655→    let scPtIdx = -1;
+  1656→    if (state.pathIdx >= 0 && state.pathIdx < this.shortcuts.length) {
+  1657→      const pr = this.shortcuts[state.pathIdx].project(p, state.ptIdx);
+  1658→      if (pr && Math.abs(pr.lateral) < 4.5) {
+  1659→        pathId = state.pathIdx; scLat = pr.lateral; scS = pr.mappedS; scPtIdx = pr.index;
+  1660→      }
+  1661→    }
+  1662→    if (pathId < 0) { // entering a branch?
+  1663→      for (let i = 0; i < this.shortcuts.length; i++) {
+  1664→        const sc = this.shortcuts[i];
+  1665→        const from = sc.pts[0].mappedS;
+  1666→        let dS = proj.s - from;
+  1667→        dS = Spline.wrapS(dS + 0.5) - 0.5; // wrap to (-0.5, 0.5]
+  1668→        if (dS < -0.015 || dS > 0.02) continue;   // must be AT the branch start
+  1669→        // must be diving OFF the road toward the branch — a kart on the
+  1670→        // racing line (small lateral) can never be yanked onto a shortcut
+  1671→        if (Math.abs(proj.lateral) < proj.halfWidth * 0.55) continue;
+  1672→        const entry = sc.pts[0].pos;
+  1673→        if (entry.distanceToSquared(p) > 14 * 14) continue;
+  1674→        const pr = sc.project(p, -1);
+  1675→        if (pr && Math.abs(pr.lateral) < 4.0 && pr.index <= 8) {
+  1676→          pathId = i; scLat = pr.lateral; scS = pr.mappedS; scPtIdx = pr.index;
+  1677→        }
+  1678→      }
+  1679→    }
+  1680→
+  1681→    const useShortcut = pathId >= 0 && Math.abs(scLat) < 3.4;
+  1682→    const info: GroundInfo = {
+  1683→      height: 0, hasGround: true, onRoad: false, roughness: 1,
+  1684→      s: proj.s, lateral: proj.lateral, onShortcut: -1,
+  1685→      mainIdx: proj.index, pathIdx: -1, onJump: proj.onJump, ptIdx: -1,
+  1686→      slope: sm.tangent.y,
+  1687→    };
+  1688→
+  1689→    if (useShortcut) {
+  1690→      const path = this.shortcuts[pathId];
+  1691→      const pt = path.pts[scPtIdx];
+  1692→      const nb = path.pts[Math.min(scPtIdx + 1, path.pts.length - 1)];
+  1693→      const pb = path.pts[Math.max(scPtIdx - 1, 0)];
+  1694→      const slope = nb.pos.distanceTo(pb.pos) > 0.01
+  1695→        ? (nb.pos.y - pb.pos.y) / nb.pos.distanceTo(pb.pos) : 0;
+  1696→      const info: GroundInfo = {
+  1697→        height: pt.pos.y, hasGround: true, onRoad: Math.abs(scLat) < 3.4, roughness: 1,
+  1698→        s: Spline.wrapS(scS), lateral: scLat, onShortcut: pathId,
+  1699→        mainIdx: proj.index, pathIdx: pathId, onJump: false, ptIdx: scPtIdx,
+  1700→        slope,
+  1701→      };
+  1702→      info.roughness = info.onRoad ? (path.rough) : 0.5;
+  1703→      info.hasGround = Math.abs(scLat) < 3.4 + 3;
+  1704→      return info;
+  1705→    }
+  1706→
+  1707→    // --- main surface classification ------------------------------------------
+  1708→    // NOTE: hasGround is one-sided — a kart high above the road still has
+  1709→    // ground (it can land), but a kart more than ~4 m BELOW the reported
+  1710→    // surface is void-bound no matter its lateral (eternal-fall bug).
+  1711→    const aboveSurface = p.y >= proj.height - 4;
+  1712→    const absMainLat = Math.abs(proj.lateral);
+  1713→    if (absMainLat <= proj.halfWidth) {
+  1714→      info.onRoad = !proj.onJump;
+  1715→      info.hasGround = !proj.onJump && aboveSurface;
+  1716→      info.height = proj.height;
+  1717→      info.roughness = 1;
+  1718→    } else if (absMainLat <= proj.halfWidth + 0.9 + this.style.skirt) {
+  1719→      info.onRoad = false;
+  1720→      info.roughness = 2.4; // offroad drag
+  1721→      // A gap is a CHASM: no shoulder ground beside jump runs either, or
+  1722→      // karts just drive around the hole through the terrain (which turned
+  1723→      // every snow/glacier gap into a slow-motion churn zone).
+  1724→      // no ledges beside jump gaps — the void extends laterally so fallen
+  1725→      // karts drop cleanly to a respawn instead of lingering in a pocket
+  1726→      // where the projection flips between the two gap edges (180 deg)
+  1727→      info.hasGround = !proj.onJump && aboveSurface && !this.nearJumpRun(proj.index);
+  1728→      const clampedLat = Math.sign(proj.lateral) * proj.halfWidth;
+  1729→      info.height = sm.pos.y + clampedLat * Math.sin(sm.bank);
+  1730→    } else {
+  1731→      info.hasGround = false; // the void
+  1732→      info.height = proj.height;
+  1733→    }
+  1734→    return info;
+  1735→  }
+  1736→
+  1737→  /** Boost pad check: returns pad if kart is on it. */
+  1738→  padAt(p: THREE.Vector3): PadInstance | null {
+  1739→    for (const pad of this.pads) {
+  1740→      const dx = p.x - pad.pos.x, dz = p.z - pad.pos.z;
+  1741→      if (dx * dx + dz * dz < 2.4 * 2.4 + 4) return pad;
+  1742→    }
+  1743→    return null;
+  1744→  }
+  1745→
+  1746→  update(t: number, dt: number): void {
+  1747→    for (const a of this.animatables) a.update(t, dt);
+  1748→  }
+  1749→
+  1750→  /** Hide an item box and schedule its respawn. */
+  1751→  consumeBox(box: ItemBox): void {
+  1752→    box.active = false;
+  1753→    box.respawnAt = performance.now() + ITEMS.boxRespawnMs;
+  1754→    box.mesh.visible = false;
+  1755→  }
+  1756→
+  1757→  dispose(): void {
+  1758→    this.group.traverse(o => {
+  1759→      const m = o as THREE.Mesh;
+  1760→      if (m.geometry) m.geometry.dispose();
+  1761→    });
+  1762→  }
+  1763→}
+  1764→
+  1765→const clampN = (v: number, a: number, b: number): number => (v < a ? a : v > b ? b : v);
+  1766→
+  1767→// ============================================================ battle arena
+  1768→
+  1769→export class BattleWorld {
+  1770→  readonly arenaId: string;
+  1771→  readonly theme: import('../core/Types').TrackTheme;
+  1772→  readonly radius: number;
+  1773→  readonly group = new THREE.Group();
+  1774→  readonly itemBoxes: ItemBox[] = [];
+  1775→  readonly obstacles: { pos: THREE.Vector3; r: number }[] = [];
+  1776→  readonly animatables: Animatable[] = [];
+  1777→  readonly style: ThemeStyle;
+  1778→  readonly pads: PadInstance[] = [];
+  1779→  readonly hazards: HazardInstance[] = [];
+  1780→  readonly railOpen = new Uint8Array(0);
+  1781→  readonly racingLine: RacingLine = { lat: new Float32Array(0), vMax: new Float32Array(0) };
+  1782→
+  1783→  constructor(arenaId: string, name: string, theme: import('../core/Types').TrackTheme, radius: number,
+  1784→    obstacles: { x: number; z: number; r: number; h?: number; kind?: string }[], decorScale: number) {
+  1785→    this.arenaId = arenaId;
+  1786→    this.theme = theme;
+  1787→    this.radius = radius;
+  1788→    const style = { ...THEMES[theme] };
+  1789→    this.style = style;
+  1790→
+  1791→    // floor disc
+  1792→    const floor = new THREE.Mesh(new THREE.CylinderGeometry(radius + 6, radius + 6, 0.6, 40),
+  1793→      mat(style.ground));
+  1794→    floor.position.y = -0.3;
+  1795→    floor.receiveShadow = true;
+  1796→    this.group.add(floor);
+  1797→    const inner = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 0.62, 40), mat(style.road));
+  1798→    inner.position.y = -0.29;
+  1799→    this.group.add(inner);
+  1800→
+  1801→    // ring wall with curb stripes
+  1802→    const wall = new THREE.Mesh(new THREE.CylinderGeometry(radius + 6.4, radius + 6.4, 2.6, 48, 1, true),
+  1803→      new THREE.MeshLambertMaterial({ color: style.curbB, side: THREE.DoubleSide }));
+  1804→    wall.position.y = 1.0;
+  1805→    this.group.add(wall);
+  1806→
+  1807→    // obstacles
+  1808→    for (const ob of obstacles) {
+  1809→      const h = ob.h ?? 2.4;
+  1810→      const m = new THREE.Mesh(new THREE.CylinderGeometry(ob.r, ob.r * 1.1, h, 10),
+  1811→        mat(theme === 'volcano' ? (ob.kind === 'lavapool' ? 0xff5a2a : 0x5a4440) :
+  1812→          ob.kind === 'machine' ? 0x8a8a92 : ob.kind === 'fountain' ? 0x9ad0e8 : 0x8a7a5a));
+  1813→      if (ob.kind === 'lavapool') (m.material as THREE.MeshLambertMaterial).emissive = new THREE.Color(0xdd3300);
+  1814→      m.position.set(ob.x, h / 2, ob.z);
+  1815→      this.group.add(m);
+  1816→      this.obstacles.push({ pos: new THREE.Vector3(ob.x, 0, ob.z), r: ob.r });
+  1817→      if (ob.kind === 'machine') {
+  1818→        this.animatables.push({ update: (t) => { m.rotation.y = t * 0.4; } });
+  1819→      }
+  1820→    }
+  1821→
+  1822→    // item boxes scattered on a ring grid
+  1823→    const rng = makeRng(555);
+  1824→    for (let i = 0; i < 14; i++) {
+  1825→      const a = (i / 14) * Math.PI * 2 + rng() * 0.3;
+  1826→      const r = radius * (0.35 + rng() * 0.5);
+  1827→      const pos = new THREE.Vector3(Math.cos(a) * r, ITEMS.boxFloatHeight, Math.sin(a) * r);
+  1828→      const mesh = makeItemBoxMesh();
+  1829→      mesh.position.copy(pos);
+  1830→      this.group.add(mesh);
+  1831→      const box: ItemBox = { pos, mesh, active: true, respawnAt: 0, golden: false };
+  1832→      this.itemBoxes.push(box);
+  1833→      this.animatables.push({
+  1834→        update: (t) => {
+  1835→          mesh.rotation.y = t * 1.4;
+  1836→          mesh.position.y = pos.y + Math.sin(t * 2 + i) * 0.25;
+  1837→          if (!box.active && performance.now() >= box.respawnAt) { box.active = true; mesh.visible = true; }
+  1838→        },
+  1839→      });
+  1840→    }
+  1841→
+  1842→    // themed scatter + sky
+  1843→    const sky = buildSky(style, theme);
+  1844→    this.group.add(sky);
+  1845→    const props = style.props;
+  1846→    if (props.length) {
+  1847→      for (let i = 0; i < Math.floor(30 * decorScale); i++) {
+  1848→        const a = rng() * Math.PI * 2;
+  1849→        const r = radius + 12 + rng() * 18;
+  1850→        const prop = buildProp(props[Math.floor(rng() * props.length)] as PropKind, rng, theme);
+  1851→        prop.position.set(Math.cos(a) * r, 0, Math.sin(a) * r);
+  1852→        this.group.add(prop);
+  1853→      }
+  1854→    }
+  1855→  }
+  1856→
+  1857→  groundQuery(p: THREE.Vector3, _state: { mainIdx: number; pathIdx: number; ptIdx: number }): GroundInfo {
+  1858→    const r = Math.hypot(p.x, p.z);
+  1859→    const inside = r < this.radius;
+  1860→    return {
+  1861→      height: 0, hasGround: r < this.radius + 5,
+  1862→      onRoad: inside, roughness: inside ? 1 : 2.2,
+  1863→      s: 0, lateral: 0, onShortcut: -1, mainIdx: -1, pathIdx: -1, ptIdx: -1, onJump: false,
+  1864→      slope: 0,
+  1865→    };
+  1866→  }
+  1867→
+  1868→  /** Radial wall: keep karts inside, damp only the outward velocity component. */
+  1869→  wallConstrain(kart: import('../karts/KartController').KartController): void {
+  1870→    const r = Math.hypot(kart.pos.x, kart.pos.z);
+  1871→    const limit = this.radius - 0.6;
+  1872→    if (r > limit) {
+  1873→      const nx = kart.pos.x / r, nz = kart.pos.z / r;
+  1874→      kart.pos.x = nx * limit; kart.pos.z = nz * limit;
+  1875→      // proportional scrub: head-on hits lose ~55%, grazing loses ~nothing
+  1876→      const fwd = kart.forward();
+  1877→      const out = Math.max(0, fwd.x * nx + fwd.z * nz);
+  1878→      if (out > 0) kart.speed *= 1 - out * 0.55;
+  1879→    }
+  1880→  }
+  1881→
+  1882→  obstacleAt(p: THREE.Vector3): { pos: THREE.Vector3; r: number } | null {
+  1883→    for (const ob of this.obstacles) {
+  1884→      const dx = p.x - ob.pos.x, dz = p.z - ob.pos.z;
+  1885→      if (dx * dx + dz * dz < (ob.r + 1.1) ** 2) return ob;
+  1886→    }
+  1887→    return null;
+  1888→  }
+  1889→
+  1890→  update(t: number, dt: number): void {
+  1891→    for (const a of this.animatables) a.update(t, dt);
+  1892→  }
+  1893→
+  1894→  dispose(): void {
+  1895→    this.group.traverse(o => {
+  1896→      const m = o as THREE.Mesh;
+  1897→      if (m.geometry) m.geometry.dispose();
+  1898→    });
+  1899→  }
+  1900→}
+  1901→
+  1902→// ============================================================ small helpers
+  1903→
+  1904→/** Floating item box: translucent cube + glowing core. */
+  1905→export function makeItemBoxMesh(golden = false): THREE.Group {
+  1906→  const g = new THREE.Group();
+  1907→  const size = golden ? 1.32 : 1.15;
+  1908→  const shell = new THREE.Mesh(new THREE.BoxGeometry(size, size, size),
+  1909→    new THREE.MeshLambertMaterial(golden
+  1910→      ? { color: 0xffc23a, transparent: true, opacity: 0.62, emissive: 0x8a5a00 }
+  1911→      : { color: 0x4a9af2, transparent: true, opacity: 0.5, emissive: 0x10305a }));
+  1912→  const core = new THREE.Mesh(new THREE.OctahedronGeometry(golden ? 0.5 : 0.42, 0),
+  1913→    new THREE.MeshBasicMaterial({ color: golden ? 0xfff2b0 : 0xffffff }));
+  1914→  const frame = new THREE.Mesh(new THREE.BoxGeometry(size + 0.07, size + 0.07, size + 0.07),
+  1915→    new THREE.MeshBasicMaterial({ color: golden ? 0xffe08a : 0xbfe0ff, wireframe: true }));
+  1916→  g.add(shell, core, frame);
+  1917→  if (golden) {
+  1918→    // little sparkles so doubles read at speed
+  1919→    for (let i = 0; i < 4; i++) {
+  1920→      const sp = new THREE.Mesh(new THREE.OctahedronGeometry(0.09, 0),
+  1921→        new THREE.MeshBasicMaterial({ color: 0xffe94a }));
+  1922→      const a = (i / 4) * Math.PI * 2;
+  1923→      sp.position.set(Math.cos(a) * 0.95, Math.sin(a * 2) * 0.5, Math.sin(a) * 0.95);
+  1924→      g.add(sp);
+  1925→    }
+  1926→  }
+  1927→  return g;
+  1928→}
+  1929→
+  1930→function makeChevronTexture(color: number): THREE.Texture {
+  1931→  const c = document.createElement('canvas');
+  1932→  c.width = 64; c.height = 64;
+  1933→  const ctx = c.getContext('2d')!;
+  1934→  const col = '#' + color.toString(16).padStart(6, '0');
+  1935→  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  1936→  ctx.fillRect(0, 0, 64, 64);
+  1937→  ctx.fillStyle = col;
+  1938→  for (let i = 0; i < 2; i++) {
+  1939→    const y = i * 32;
+  1940→    ctx.beginPath();
+  1941→    ctx.moveTo(6, y + 26); ctx.lineTo(32, y + 4); ctx.lineTo(58, y + 26);
+  1942→    ctx.lineTo(58, y + 18); ctx.lineTo(32, y - 4); ctx.lineTo(6, y + 18);
+  1943→    ctx.closePath(); ctx.fill();
+  1944→  }
+  1945→  const tex = new THREE.CanvasTexture(c);
+  1946→  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  1947→  return tex;
+  1948→}
+  1949→
+  1950→function makeBannerTexture(): THREE.Texture {
+  1951→  const c = document.createElement('canvas');
+  1952→  c.width = 512; c.height = 96;
+  1953→  const ctx = c.getContext('2d')!;
+  1954→  ctx.fillStyle = '#151522'; ctx.fillRect(0, 0, 512, 96);
+  1955→  // checkered strips top + bottom
+  1956→  const sq = 12;
+  1957→  for (const rowY of [0, 96 - sq]) {
+  1958→    for (let x = 0; x < 512 / sq; x++) {
+  1959→      if (x % 2 === 0) { ctx.fillStyle = '#ffffff'; ctx.fillRect(x * sq, rowY, sq, sq); }
+  1960→    }
+  1961→  }
+  1962→  // red racing band with subtle sheen
+  1963→  const grad = ctx.createLinearGradient(0, 12, 0, 84);
+  1964→  grad.addColorStop(0, '#ff4a5a');
+  1965→  grad.addColorStop(0.5, '#d8203a');
+  1966→  grad.addColorStop(1, '#a81028');
+  1967→  ctx.fillStyle = grad;
+  1968→  ctx.fillRect(0, 12, 512, 72);
+  1969→  // brand text with outline
+  1970→  ctx.font = 'bold 44px sans-serif';
+  1971→  ctx.textAlign = 'center';
+  1972→  ctx.textBaseline = 'middle';
+  1973→  ctx.lineWidth = 7;
+  1974→  ctx.strokeStyle = '#3a0a14';
+  1975→  ctx.strokeText('APEX KART', 256, 48);
+  1976→  ctx.fillStyle = '#ffffff';
+  1977→  ctx.fillText('APEX KART', 256, 48);
+  1978→  // side pips
+  1979→  ctx.fillStyle = '#ffe94a';
+  1980→  ctx.beginPath(); ctx.arc(36, 48, 9, 0, Math.PI * 2); ctx.fill();
+  1981→  ctx.beginPath(); ctx.arc(476, 48, 9, 0, Math.PI * 2); ctx.fill();
+  1982→  const tex = new THREE.CanvasTexture(c);
+  1983→  tex.wrapS = THREE.RepeatWrapping;
+  1984→  tex.repeat.set(2, 1);
+  1985→  return tex;
+  1986→}
+  1987→
+  1988→function makeMoverMesh(label: string): THREE.Object3D {
+  1989→  const g = new THREE.Group();
+  1990→  switch (label) {
+  1991→    case 'hay': {
+  1992→      const b = new THREE.Mesh(new THREE.CylinderGeometry(1.1, 1.1, 1.4, 10), mat(0xd8b64a));
+  1993→      b.rotation.z = Math.PI / 2; g.add(b);
+  1994→      g.userData.lift = 1.1; g.userData.spin = 3.2;
+  1995→      break;
+  1996→    }
+  1997→    case 'crab': {
+  1998→      const body = new THREE.Mesh(new THREE.SphereGeometry(0.7, 8, 6), mat(0xe84a3a));
+  1999→      body.scale.y = 0.5; body.position.y = 0.35; g.add(body);
+  2000→      for (const s of [-1, 1]) {
+
+[showing lines 1-2000 of 2102; use offset=2001 with limit to continue reading]

@@ -1,0 +1,10 @@
+[race-service] Installing dependencies...
+bun install v1.3.14 (0d9b296a)
+
++ socket.io@4.8.3
+
+22 packages installed [115.00ms]
+[race-service] Running bun run dev...
+$ bun --hot index.ts
+APEX race service listening on :3003
+error: Module not found '/home/z/my-project/mini-services/race-service/index.ts'
