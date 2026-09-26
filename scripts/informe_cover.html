@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <style>
+    @page { size: 794px 1123px; margin: 0; }
+    :root {
+      --c-bg: #0a1628;        /* azul noche profundo */
+      --c-accent: #4da8da;    /* azul luminoso */
+      --c-text: #e8f0f8;      /* blanco frío */
+      --c-muted: #7a9bb8;     /* azul grisáceo */
+      --c-glow: #2d7ab3;      /* azul medio (halo) */
+    }
+    html, body {
+      margin: 0; padding: 0;
+      width: 794px; height: 1123px;
+      background: var(--c-bg);
+      color: var(--c-text);
+      font-family: 'Inter', sans-serif;
+    }
+    @media screen {
+      html { height: auto; display: flex; justify-content: center; min-height: 100vh; background: var(--c-bg); }
+      body { transform-origin: top center; scale: min(1, calc(100vw / 794), calc(100vh / 1123)); margin: 0 auto; box-shadow: 0 0 60px rgba(0,0,0,0.4); }
+    }
+    .cover { width: 794px; height: 1123px; position: relative; box-sizing: border-box;
+             border: none; outline: none; box-shadow: none; }
+
+    /* Capa 1 — fondo (halos suaves, recortados) */
+    .bg-layer {
+      position: absolute; inset: 0; overflow: hidden; z-index: 1;
+      background:
+        radial-gradient(circle at 18% 16%, rgba(77,168,218,0.09), transparent 42%),
+        radial-gradient(circle at 84% 82%, rgba(45,122,179,0.08), transparent 46%);
+    }
+
+    /* Capa 2 — estructura: marco rectangular luminoso (4 bordes) */
+    .fr-top    { position: absolute; left: 60px; top: 80px;    width: 674px; height: 2px; background: var(--c-accent); z-index: 2; }
+    .fr-bottom { position: absolute; left: 60px; top: 1041px;  width: 674px; height: 2px; background: var(--c-accent); z-index: 2; }
+    .fr-left   { position: absolute; left: 60px; top: 80px;    width: 2px;  height: 963px; background: var(--c-accent); z-index: 2; }
+    .fr-right  { position: absolute; left: 732px; top: 80px;   width: 2px;  height: 963px; background: var(--c-accent); z-index: 2; }
+
+    /* Capa 3 — contenido */
+    .content { position: absolute; inset: 0; z-index: 3; }
+    .kicker {
+      position: absolute; left: 110px; top: 138px;
+      font-size: 11pt; font-weight: 300; color: var(--c-accent);
+      letter-spacing: 5px; text-transform: uppercase;
+      font-family: 'Inter', sans-serif;
+    }
+    .hero {
+      position: absolute; left: 110px; top: 232px;
+      font-family: 'Playfair Display', serif;
+      font-size: 54pt; font-weight: 900; line-height: 1.15;
+      color: var(--c-text); max-width: 560px;
+      text-shadow: 0 0 26px rgba(77,168,218,0.35);
+    }
+    .summary {
+      position: absolute; left: 110px; top: 508px;
+      font-size: 15pt; font-weight: 300; line-height: 1.7;
+      color: var(--c-muted); max-width: 520px;
+    }
+    .org {
+      position: absolute; left: 110px; top: 742px;
+      font-size: 18pt; font-weight: 500; color: var(--c-text);
+    }
+    .org-sub {
+      position: absolute; left: 110px; top: 786px;
+      font-size: 11pt; font-weight: 300; color: var(--c-muted);
+      line-height: 1.5; max-width: 480px;
+    }
+    .date {
+      position: absolute; left: 110px; top: 962px;
+      font-size: 10pt; font-weight: 300; color: var(--c-muted);
+      letter-spacing: 3px; text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+  <div class="cover">
+    <div class="bg-layer"></div>
+    <div class="fr-top"></div>
+    <div class="fr-bottom"></div>
+    <div class="fr-left"></div>
+    <div class="fr-right"></div>
+    <div class="content">
+      <div class="kicker">Consultoría de Diseño de Videojuegos</div>
+      <div class="hero">APEX<br>KART</div>
+      <div class="summary">
+        Diagnóstico técnico del game feel frente al estándar de Mario Kart y
+        especificación de una dirección visual realista: materiales PBR con
+        clearcoat, iluminación de imagen, sombras definidas y asfalto pulido,
+        con hoja de ruta priorizada y métricas de validación.
+      </div>
+      <div class="org">Informe de Consultoría de Diseño</div>
+      <div class="org-sub">Análisis de game feel y dirección visual sobre el código fuente del proyecto</div>
+      <div class="date">Septiembre 2026</div>
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "Based on the image provided, here is a description of the **center** of the image:\n\n*   **Road Surface & Markings:** There is **no visible road surface** or lane markings in the center. The area is almost entirely black, representing the night sky or darkness ahead.\n*   **Karts:** You can see the back of a **blue/purple kart** (the player's vehicle) and the front of a **green kart** directly in the center-foreground, but they are partially obscured by the large text.\n*   **Neon Buildings:** There are **no neon buildings** in the center. The vertical blue pillars and colorful neon strips are located higher up and to the sides, framing the center rather than being in it.\n*   **Track vs. Sky Percentage:** The image is dominated by the **sky/darkness**, which likely makes up **70-80%** of the frame. The actual track surface and karts only occupy the bottom **20-30%**.\n*   **Readability:** The scene is **not readable enough to race** effectively at this exact moment. The view is blocked by a massive, bright green \"**¡YA!**\" (Spanish for \"GO!\") text overlay, and the track ahead is shrouded in darkness with no visible guiding lines or curbs.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1789584841,
+  "id": "20260917025352e3f397d519904076",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "20260917025352e3f397d519904076",
+  "usage": {
+    "completion_tokens": 273,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 959,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "total_tokens": 1232
+  }
+}

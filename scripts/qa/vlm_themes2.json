@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "*   **Image 1 (Volcano):** No, the track and karts are mostly dark silhouettes and difficult to read.\n*   **Image 2 (Neon City):** Partially; the neon lights and UI are visible, but the karts and track surface are very dark.\n*   **Image 3 (Space Station):** No, the scene is extremely dark with almost no visible detail on the karts or the track.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1789584624,
+  "id": "20260917025021a453350e16584197",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "20260917025021a453350e16584197",
+  "usage": {
+    "completion_tokens": 95,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 2693,
+    "prompt_tokens_details": {
+      "cached_tokens": 2
+    },
+    "total_tokens": 2788
+  }
+}

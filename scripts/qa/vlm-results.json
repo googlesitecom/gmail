@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "1) No, there is no results/podium table visible. The screen shows active gameplay (Lap 1/3).\n2) No, the UI appears to be functioning normally during a race.\n3) No, there is no continue or retry button; only in-race HUD elements (minimap, speedometer, etc.) are present.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1789590869,
+  "id": "2026091704342539fd765ac73a4578",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "2026091704342539fd765ac73a4578",
+  "usage": {
+    "completion_tokens": 72,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1720,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "total_tokens": 1792
+  }
+}
